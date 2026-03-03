@@ -1,0 +1,21 @@
+# 知识图谱项目
+version: '3'
+services:
+  kg-neo4j:
+    image: neo4j:2026.01.4-community
+    # build: ./neo4j
+    ports:
+    #   - '7473:7473'
+      - '58274:7474'
+      - '58287:7687'
+    environment:
+      - NEO4J_AUTH=neo4j/1kcsy2C7Vrn9JHuh
+      # - NEO4J_dbms_memory_heap_initial__size=512m
+      # - NEO4J_dbms_memory_heap_max__size=4G
+      # - NEO4J_dbms_memory_pagecache_size=1G
+      # - NEO4J_dbms_default__listen__address=0.0.0.0
+    volumes:
+      - ./neo_data:/data
+      # - ./neo4j/data:/var/lib/neo4j/data
+    stdin_open: true # -i interactive
+    tty: true # -t tty
