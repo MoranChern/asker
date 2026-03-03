@@ -67,7 +67,7 @@ from neo4j_graphrag.retrievers.base import Retriever
 from neo4j_graphrag.schema import get_schema
 from neo4j_graphrag.types import RawSearchResult, RetrieverResult, RetrieverResultItem
 
-from neo4j_graphrag.llm.base import LLMInterface
+from neo4j_graphrag.llm.base import LLMInterfaceV2
 from neo4j_graphrag.llm.types import LLMResponse
 from neo4j_graphrag.types import LLMMessage
 
@@ -203,7 +203,7 @@ def index_exists(driver: neo4j.Driver, name: str) -> bool:
 # LLM adapter (Qwen via llama.cpp) for neo4j-graphrag
 # =============================================================================
 
-class QwenLLM(LLMInterface):
+class QwenLLM(LLMInterfaceV2):
     supports_structured_output: bool = False
 
     def __init__(self, model_name: str = "qwen-local", model_params: Optional[dict] = None):
@@ -517,7 +517,7 @@ class RobustText2CypherRetriever(Retriever):
     def __init__(
         self,
         driver: neo4j.Driver,
-        llm: LLMInterface,
+        llm: LLMInterfaceV2,
         neo4j_schema: Optional[str] = None,
         max_attempts: int = T2C_MAX_ATTEMPTS,
         limit: int = T2C_LIMIT,
