@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GraphRAG WebApp</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Cytoscape for graph visualization -->
+  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+</head>
+<body>
+  <div id="stream"></div>
+
+  <div id="detailPanel" class="detail hidden">
+    <div class="detail-header">
+      <div id="detailTitle" class="detail-title">Detail</div>
+      <button id="detailClose" class="detail-close">✕</button>
+    </div>
+    <pre id="detailContent" class="detail-content"></pre>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

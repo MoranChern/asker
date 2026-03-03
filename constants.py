@@ -44,3 +44,26 @@ QWEN_TOP_K = 20
 QWEN_TOP_P = 0.95
 QWEN_MIN_P = 0.0
 QWEN_PRESENCE_PENALTY = 1.5
+
+# -------------------------
+# Web server (FastAPI/Uvicorn) config
+# -------------------------
+# IMPORTANT: Per requirement, server.py MUST NOT read configuration from environment variables.
+#           Edit these constants directly.
+SERVER_BIND_HOST = "0.0.0.0"
+SERVER_BIND_PORT = 8000
+
+# Max concurrent GPU worker processes (avoid GPU OOM)
+SERVER_GPU_WORKERS = 1
+
+# GPU worker process management
+SERVER_WORKER_HEARTBEAT_SEC = 2.0
+SERVER_WORKER_TERMINATE_TIMEOUT_SEC = 2.0
+SERVER_WORKER_KILL_TIMEOUT_SEC = 2.0
+
+# -------------------------
+# Server retrieval config
+# -------------------------
+SERVER_FULLTEXT_INDEX_NAME = "graphrag_fulltext_rag"
+SERVER_TOP_K = 8
+SERVER_EXPAND_K = 20
