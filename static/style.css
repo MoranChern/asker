@@ -78,10 +78,39 @@ pre {
 
 .final-text {
   margin-top: 10px;
-  white-space: pre-wrap;
-  word-break: break-word;
   line-height: 1.55;
+  word-break: break-word;
 }
+
+.final-text p { margin: 0.6em 0; }
+.final-text h1, .final-text h2, .final-text h3 { margin: 0.75em 0 0.4em 0; line-height: 1.25; }
+.final-text ul, .final-text ol { margin: 0.6em 0 0.6em 1.2em; padding: 0; }
+.final-text li { margin: 0.25em 0; }
+.final-text code {
+  background: rgba(0,0,0,0.25);
+  padding: 0.1em 0.35em;
+  border-radius: 6px;
+}
+.final-text pre {
+  margin: 10px 0 0 0;
+  background: rgba(0,0,0,0.25);
+  padding: 10px 12px;
+  border-radius: 10px;
+  overflow: auto;
+  white-space: pre;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.final-text pre code { background: transparent; padding: 0; }
+.final-text a { color: rgba(255,255,255,0.98); text-decoration: underline; }
+.final-text blockquote {
+  margin: 0.6em 0;
+  padding-left: 12px;
+  border-left: 3px solid rgba(255,255,255,0.35);
+  opacity: 0.95;
+}
+.final-text table { border-collapse: collapse; margin: 0.6em 0; width: 100%; }
+.final-text th, .final-text td { border: 1px solid rgba(255,255,255,0.25); padding: 6px 8px; }
 
 .evidence-list {
   display: flex;

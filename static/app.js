@@ -18,6 +18,21 @@ function scrollToBottom() {
   window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
 }
 
+function renderMarkdown(el, mdText) {
+  // Final answer text is Markdown; render it to HTML for display.
+  const markedLib = window.marked;
+  if (!markedLib) {
+    el.textContent = mdText;
+    return;
+  }
+  let html = markedLib.parse(mdText ?? "", { gfm: true, breaks: true });
+  if (window.DOMPurify) {
+    html = window.DOMPurify.sanitize(html);
+  }
+  el.innerHTML = html;
+}
+
+
 function mkBlock(type) {
   const div = document.createElement("div");
   div.className = `block ${type}`;
@@ -91,7 +106,7 @@ function mkAnswerBlock() {
 
   const evidenceDetails = document.createElement("details");
   evidenceDetails.className = "section";
-  evidenceDetails.open = true;
+  evidenceDetails.open = false;
 
   const evidenceSummary = document.createElement("summary");
   evidenceSummary.textContent = "Evidence";
@@ -168,16 +183,16 @@ function renderEvidenceItem(item, evidenceList) {
           "label": "data(label)",
           "font-size": 10,
           "text-wrap": "wrap",
-          "text-max-width": 110,
+          "text-max-width": 56,
           "text-valign": "center",
           "text-halign": "center",
           "background-color": "#2b7cff",
           "color": "#111",
           "border-width": 1,
           "border-color": "#111",
-          "width": "label",
-          "padding": "10px",
-          "shape": "round-rectangle",
+          "shape": "ellipse",
+          "width": 60,
+          "height": 60,
         },
       },
       {
@@ -276,14 +291,21 @@ function connectWS() {
         active.thinkingDetails.open = false;
         active.evidenceDetails.open = false;
       }
-      active.finalText.textContent += msg.text ?? "";
+active.answerMd = (active.answerMd ?? "") + (msg.text ?? "");
+renderMarkdown(active.finalText, active.answerMd);
       scrollToBottom();
       return;
     }
 
     if (msg.type === "error") {
       const trace = msg.trace ? `\n${msg.trace}` : "";
-      active.finalText.textContent += `\n[error] ${msg.message ?? "unknown"}${trace}\n`;
+          active.answerMd = (active.answerMd ?? "") + `
+
+\`\`\`
+[error] ${msg.message ?? "unknown"}${trace}
+\`\`\`
+`;
+          renderMarkdown(active.finalText, active.answerMd);
       scrollToBottom();
       return;
     }
@@ -313,7 +335,7 @@ function sendQuestion(text, inputBlock) {
   // create answer block
   const ans = mkAnswerBlock();
   streamEl.appendChild(ans.block);
-  active = { ...ans, answerStarted: false };
+  active = { ...ans, answerStarted: false, answerMd: "" };
 
   // send to server
   ws.send(JSON.stringify({ type: "question", text }));

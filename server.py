@@ -588,6 +588,9 @@ async def _spawn_gpu_worker(messages: List[Dict[str, str]], websocket: WebSocket
                 heartbeat_task.cancel()
                 try:
                     await heartbeat_task
+                except asyncio.CancelledError:
+                    # Normal on shutdown / disconnect in Python 3.13+ (inherits from BaseException)
+                    pass
                 except Exception:
                     pass
 
@@ -595,6 +598,9 @@ async def _spawn_gpu_worker(messages: List[Dict[str, str]], websocket: WebSocket
                 stderr_task.cancel()
                 try:
                     await stderr_task
+                except asyncio.CancelledError:
+                    # Normal on shutdown / disconnect in Python 3.13+ (inherits from BaseException)
+                    pass
                 except Exception:
                     pass
 
