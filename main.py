@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-test.py
+main.py
 
 CLI entrypoint (main program logic) extracted from the original graphrag_app.py.
 
 Usage:
-  python test.py
-  python test.py --build-index
+  python main.py
+  python main.py --build-index
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
 
         if not index_exists(driver, VECTOR_INDEX_NAME):
             print("[info] Vector index not found. Hybrid retrieval will be disabled until you run:")
-            print("       python test.py --build-index")
+            print("       python main.py --build-index")
 
         retriever = build_retriever(driver, enable_hybrid=not args.no_hybrid)
 
