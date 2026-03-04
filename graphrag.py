@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -182,6 +183,19 @@ def create_driver() -> neo4j.Driver:
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 
+def _format_eta(seconds: Optional[float]) -> str:
+    if seconds is None or seconds != seconds or seconds < 0 or seconds == float("inf"):
+        return "--"
+    sec = int(round(seconds))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m > 0:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
 # =============================================================================
 # LLM adapter (Qwen via llama.cpp) for neo4j-graphrag
 # =============================================================================
@@ -253,16 +267,90 @@ class QwenLLM(LLMInterfaceV2):
 TEXT_PROPS = ["Name", "Description", "name", "description"]
 
 
-def tag_rag_nodes(driver: neo4j.Driver) -> int:
-    """Tag nodes that have any text-ish property with :RAG_LABEL."""
+def tag_rag_nodes(
+    driver: neo4j.Driver,
+    batch_size: int = 10000,
+    verbose: bool = False,
+    min_print_interval_sec: float = 2.0,
+) -> int:
+    """Tag nodes that have any non-empty text-ish property with :RAG_LABEL.
+
+    Notes:
+    - For million-scale graphs, doing it in one big transaction can look "stuck".
+      This implementation updates in batches and optionally prints progress + ETA.
+    """
     cypher = f"""
     MATCH (n)
-    WHERE any(p IN $props WHERE n[p] IS NOT NULL)
+    WHERE any(p IN $props WHERE n[p] IS NOT NULL AND toString(n[p]) <> '')
+      AND NOT n:`{RAG_LABEL}`
+    WITH n
+    LIMIT $limit
     SET n:`{RAG_LABEL}`
     RETURN count(n) AS tagged
     """
-    rows = neo4j_run(driver, cypher, {"props": TEXT_PROPS})
-    return int(rows[0]["tagged"]) if rows else 0
+
+    count_cypher = f"""
+    MATCH (n)
+    WHERE any(p IN $props WHERE n[p] IS NOT NULL AND toString(n[p]) <> '')
+      AND NOT n:`{RAG_LABEL}`
+    RETURN count(n) AS total
+    """
+
+    total = 0
+    batch = 0
+    t0 = time.time()
+    last_print = 0.0
+
+    target: Optional[int] = None
+    if verbose:
+        try:
+            rows = neo4j_run(driver, count_cypher, {"props": TEXT_PROPS})
+            target = int(rows[0]["total"]) if rows else None
+        except Exception:
+            target = None
+
+        if target is not None:
+            print(f"[tag] start batch_size={batch_size} target={target}", flush=True)
+        else:
+            print(f"[tag] start batch_size={batch_size} target=unknown", flush=True)
+
+    while True:
+        batch += 1
+        rows = neo4j_run(driver, cypher, {"props": TEXT_PROPS, "limit": int(batch_size)})
+        tagged = int(rows[0]["tagged"]) if rows else 0
+        if tagged <= 0:
+            break
+
+        total += tagged
+
+        if verbose:
+            now = time.time()
+            if last_print == 0.0 or (now - last_print) >= float(min_print_interval_sec):
+                elapsed = max(1e-6, now - t0)
+                rate = total / elapsed
+
+                eta_sec: Optional[float] = None
+                pct_str = ""
+                if target is not None and target > 0:
+                    remain = max(0, target - total)
+                    eta_sec = (remain / rate) if rate > 1e-9 else None
+                    pct = min(100.0, (total / target) * 100.0)
+                    pct_str = f" {pct:.2f}%"
+
+                eta_str = _format_eta(eta_sec)
+                tgt_str = str(target) if target is not None else "?"
+                print(
+                    f"[tag] batch={batch} +{tagged} total={total}/{tgt_str}{pct_str} "
+                    f"elapsed={elapsed:.1f}s rate={rate:.1f} nodes/s eta={eta_str}",
+                    flush=True,
+                )
+                last_print = now
+
+    if verbose:
+        elapsed = max(1e-6, time.time() - t0)
+        print(f"[tag] done total={total} elapsed={elapsed:.1f}s", flush=True)
+
+    return total
 
 
 def make_embedder():
@@ -275,13 +363,29 @@ def make_embedder():
     return SentenceTransformerEmbeddings(model=EMBED_MODEL, **kwargs)
 
 
-def build_indexes(driver: neo4j.Driver, embedder, similarity: str = "cosine") -> int:
+def build_indexes(
+    driver: neo4j.Driver,
+    embedder,
+    similarity: str = "cosine",
+    tag_batch_size: int = 10000,
+    verbose: bool = False,
+    min_print_interval_sec: float = 2.0,
+) -> int:
     """Ensure :RAG_LABEL exists, create fulltext + vector index if needed. Returns embedding dim."""
     # Lazy imports to avoid heavy deps unless called
     from neo4j_graphrag.indexes import create_vector_index, create_fulltext_index  # local import
 
-    tag_rag_nodes(driver)
+    if verbose:
+        print("[build] tagging RAG nodes (batched)...", flush=True)
+    tag_rag_nodes(
+        driver,
+        batch_size=tag_batch_size,
+        verbose=verbose,
+        min_print_interval_sec=min_print_interval_sec,
+    )
 
+    if verbose:
+        print("[build] ensuring fulltext index...", flush=True)
     if not index_exists(driver, FULLTEXT_INDEX_NAME):
         create_fulltext_index(
             driver,
@@ -292,8 +396,12 @@ def build_indexes(driver: neo4j.Driver, embedder, similarity: str = "cosine") ->
             neo4j_database=NEO4J_DATABASE,
         )
 
+    if verbose:
+        print("[build] probing embedding dimension...", flush=True)
     dim = len(embedder.embed_query("dimension probe"))
 
+    if verbose:
+        print("[build] ensuring vector index...", flush=True)
     if not index_exists(driver, VECTOR_INDEX_NAME):
         create_vector_index(
             driver,
@@ -305,6 +413,9 @@ def build_indexes(driver: neo4j.Driver, embedder, similarity: str = "cosine") ->
             fail_if_exists=False,
             neo4j_database=NEO4J_DATABASE,
         )
+
+    if verbose:
+        print(f"[build] indexes ready (dim={dim})", flush=True)
 
     return dim
 
@@ -323,16 +434,67 @@ def embed_missing_nodes(
     batch_size: int = 128,
     max_nodes: int = 0,
     force_reembed: bool = False,
+    verbose: bool = False,
+    min_print_interval_sec: float = 2.0,
 ) -> int:
-    """Compute embeddings for nodes that miss EMBEDDING_PROPERTY (or force)."""
+    """Compute embeddings for nodes that miss EMBEDDING_PROPERTY (or force).
+
+    For million-scale graphs, this runs in small batches and can optionally print progress + ETA.
+    """
     from neo4j_graphrag.indexes import upsert_vectors  # local import
 
     total = 0
+    batch = 0
+    t0 = time.time()
+    last_print = 0.0
+
+    where = "true" if force_reembed else f"n.`{EMBEDDING_PROPERTY}` IS NULL"
+
+    count_cypher = f"""
+    MATCH (n:`{RAG_LABEL}`)
+    WHERE {where}
+      AND (
+        coalesce(n.Name, n.name, '') <> ''
+        OR coalesce(n.Description, n.description, '') <> ''
+      )
+    RETURN count(n) AS total
+    """
+
+    target: Optional[int] = None
+    if verbose:
+        try:
+            rows = neo4j_run(driver, count_cypher)
+            raw_target = int(rows[0]["total"]) if rows else 0
+            if max_nodes and max_nodes > 0:
+                target = min(raw_target, int(max_nodes))
+            else:
+                target = raw_target
+        except Exception:
+            target = None
+
+        tgt_str = str(target) if target is not None else "unknown"
+        print(
+            f"[embed] start batch_size={batch_size} target={tgt_str} force_reembed={force_reembed}",
+            flush=True,
+        )
+
     while True:
-        where = "true" if force_reembed else f"n.`{EMBEDDING_PROPERTY}` IS NULL"
+        batch += 1
+
+        # LIMIT is computed from remaining max_nodes (if any).
+        limit = int(batch_size)
+        if max_nodes and (max_nodes - total) < limit:
+            limit = max(0, int(max_nodes - total))
+        if limit <= 0:
+            break
+
         cypher = f"""
         MATCH (n:`{RAG_LABEL}`)
         WHERE {where}
+          AND (
+            coalesce(n.Name, n.name, '') <> ''
+            OR coalesce(n.Description, n.description, '') <> ''
+          )
         WITH n
         RETURN
           elementId(n) AS eid,
@@ -340,7 +502,8 @@ def embed_missing_nodes(
           coalesce(n.Description, n.description, '') AS desc
         LIMIT $limit
         """
-        rows = neo4j_run(driver, cypher, {"limit": batch_size})
+
+        rows = neo4j_run(driver, cypher, {"limit": limit})
         if not rows:
             break
 
@@ -348,20 +511,24 @@ def embed_missing_nodes(
         texts: List[str] = []
         for r in rows:
             txt = make_text_for_embedding(r.get("name", ""), r.get("desc", ""))
-            if not txt.strip():
+            txt = (txt or "").strip()
+            if not txt:
                 continue
             eids.append(r["eid"])
             texts.append(txt)
 
         if not eids:
-            break
+            # Should be rare due to query-level filter; continue to next batch to avoid stopping early.
+            continue
 
+        # Embed
         try:
             vecs = embedder.model.encode(texts)  # type: ignore[attr-defined]
             embeddings = vecs.tolist() if hasattr(vecs, "tolist") else [embedder.embed_query(t) for t in texts]
         except Exception:
             embeddings = [embedder.embed_query(t) for t in texts]
 
+        # Upsert
         upsert_vectors(
             driver,
             ids=eids,
@@ -371,8 +538,36 @@ def embed_missing_nodes(
         )
 
         total += len(eids)
+
+        if verbose:
+            now = time.time()
+            if last_print == 0.0 or (now - last_print) >= float(min_print_interval_sec):
+                elapsed = max(1e-6, now - t0)
+                rate = total / elapsed
+
+                eta_sec: Optional[float] = None
+                pct_str = ""
+                tgt_str = str(target) if target is not None else "?"
+                if target is not None and target > 0:
+                    remain = max(0, target - total)
+                    eta_sec = (remain / rate) if rate > 1e-9 else None
+                    pct = min(100.0, (total / target) * 100.0)
+                    pct_str = f" {pct:.2f}%"
+
+                eta_str = _format_eta(eta_sec)
+                print(
+                    f"[embed] batch={batch} +{len(eids)} total={total}/{tgt_str}{pct_str} "
+                    f"elapsed={elapsed:.1f}s rate={rate:.1f} nodes/s eta={eta_str}",
+                    flush=True,
+                )
+                last_print = now
+
         if max_nodes and total >= max_nodes:
             break
+
+    if verbose:
+        elapsed = max(1e-6, time.time() - t0)
+        print(f"[embed] done total={total} elapsed={elapsed:.1f}s", flush=True)
 
     return total
 

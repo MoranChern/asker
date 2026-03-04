@@ -40,7 +40,9 @@ def cmd_build_index(args: argparse.Namespace) -> None:
 
     try:
         embedder = make_embedder()
-        dim = build_indexes(driver, embedder, similarity=args.similarity)
+        print('[step] Building indexes (batched tagging + index creation)...', flush=True)
+        dim = build_indexes(driver, embedder, similarity=args.similarity, verbose=True)
+        print('[step] Index build finished.', flush=True)
         print(f"[ok] Indexes ready. Embedding dimension = {dim}")
 
         embedded = embed_missing_nodes(
@@ -49,6 +51,7 @@ def cmd_build_index(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             max_nodes=args.max_nodes,
             force_reembed=args.force_reembed,
+            verbose=True,
         )
         print(f"[ok] Embedded nodes updated: {embedded}")
     finally:
