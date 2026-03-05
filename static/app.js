@@ -33,6 +33,34 @@ function renderMarkdown(el, mdText) {
 }
 
 
+function enableAutoResizeTextarea(ta) {
+  if (!ta) return;
+
+  const resize = () => {
+    // Reset first so it can shrink when text is deleted.
+    ta.style.height = "auto";
+    ta.style.height = `${ta.scrollHeight}px`;
+  };
+
+  let composing = false;
+
+  // Better behavior for Chinese/IME input.
+  ta.addEventListener("compositionstart", () => { composing = true; });
+  ta.addEventListener("compositionend", () => {
+    composing = false;
+    requestAnimationFrame(resize);
+  });
+
+  ta.addEventListener("input", () => {
+    if (composing) return;
+    requestAnimationFrame(resize);
+  });
+
+  // Init (covers default value / first render)
+  requestAnimationFrame(resize);
+}
+
+
 function mkBlock(type) {
   const div = document.createElement("div");
   div.className = `block ${type}`;
@@ -42,19 +70,21 @@ function mkBlock(type) {
 function mkInputBlock() {
   const b = mkBlock("input");
 
-  const title = document.createElement("div");
-  title.className = "title";
-  title.textContent = "Input";
-  b.appendChild(title);
+  // const title = document.createElement("div");
+  // title.className = "title";
+  // title.textContent = "Input";
+  // b.appendChild(title);
 
   const ta = document.createElement("textarea");
   ta.placeholder = "输入问题，Ctrl+Enter 发送";
   b.appendChild(ta);
 
-  const hint = document.createElement("div");
-  hint.className = "hint";
-  hint.textContent = "快捷键：Ctrl+Enter 发送";
-  b.appendChild(hint);
+  enableAutoResizeTextarea(ta);
+
+  // const hint = document.createElement("div");
+  // hint.className = "hint";
+  // hint.textContent = "快捷键：Ctrl+Enter 发送";
+  // b.appendChild(hint);
 
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && e.ctrlKey) {
@@ -265,13 +295,13 @@ function connectWS() {
 
     if (msg.type === "thinking_round") {
       active.thinkingPre.textContent += `\n\n【思考 ${msg.round}】\n`;
-      scrollToBottom();
+      // scrollToBottom();
       return;
     }
 
     if (msg.type === "thinking") {
       active.thinkingPre.textContent += msg.text ?? "";
-      scrollToBottom();
+      // scrollToBottom();
       return;
     }
 
@@ -280,7 +310,7 @@ function connectWS() {
       for (const it of items) {
         renderEvidenceItem(it, active.evidenceList);
       }
-      scrollToBottom();
+      // scrollToBottom();
       return;
     }
 

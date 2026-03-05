@@ -2,40 +2,29 @@
 """
 graphrag.py
 
-GraphRAG business logic extracted from the original graphrag_app.py.
+GraphRAG *retrieval tool* + (optional) index build utilities.
 
-Design goals:
-- Keep GraphRAG / Neo4j retrieval, indexing, prompt templates here.
-- Keep *application entrypoints* (CLI loop, web server, etc.) outside (see test.py, server.py).
-- Avoid importing llama_cpp / GPU code at import-time:
-  Qwen adapter performs a lazy import of qwen.py only when instantiated.
+Per updated design:
+- Answering / agent orchestration lives in agent.py.
+- This module provides ONLY:
+  1) Neo4j connection helpers
+  2) Evidence retrieval (given keywords from the agent)
+  3) Index build helpers (CLI/offline), implemented with lazy imports
 
-This file can be imported safely by server.py without triggering GPU usage,
-as long as you do NOT instantiate QwenLLM / LLM_QWEN_Standalone.
+IMPORTANT:
+- Do NOT import llama_cpp here.
+- Keep imports lightweight at module import time (server.py imports this module).
 """
 
 from __future__ import annotations
 
 import os
 import re
-import json
 import time
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import neo4j
 from neo4j import GraphDatabase  # type: ignore
-from neo4j.exceptions import CypherSyntaxError, Neo4jError  # type: ignore
-
-# neo4j-graphrag core (lightweight; does not load local GPU model)
-from neo4j_graphrag.generation.prompts import RagTemplate, Text2CypherTemplate
-from neo4j_graphrag.retrievers.base import Retriever
-from neo4j_graphrag.schema import get_schema
-from neo4j_graphrag.types import RawSearchResult, RetrieverResult, RetrieverResultItem
-
-from neo4j_graphrag.llm.base import LLMInterfaceV2
-from neo4j_graphrag.types import LLMMessage
-
 
 # ---- Optional centralized constants (preferred) ----
 try:
@@ -51,14 +40,15 @@ def _cget(name: str, default):
 
 
 # =============================================================================
-# CONFIG (edit constants.py or via env vars)
+# CONFIG
 # =============================================================================
-
+# For CLI usage we allow env overrides; server.py is required to read only constants.py.
 NEO4J_URI = os.getenv("NEO4J_URI", _cget("NEO4J_URI", "bolt://localhost:58287"))
 NEO4J_USER = os.getenv("NEO4J_USER", _cget("NEO4J_USER", "neo4j"))
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", _cget("NEO4J_PASSWORD", "password"))
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", _cget("NEO4J_DATABASE", "neo4j"))
 
+# RAG tagging / embedding
 RAG_LABEL = os.getenv("GRAPHRAG_RAG_LABEL", "RAG")
 EMBEDDING_PROPERTY = os.getenv("GRAPHRAG_EMBEDDING_PROPERTY", "embedding")
 
@@ -68,109 +58,31 @@ FULLTEXT_INDEX_NAME = os.getenv("GRAPHRAG_FULLTEXT_INDEX", "graphrag_fulltext_ra
 TOP_K = int(os.getenv("GRAPHRAG_TOP_K", "8"))
 EXPAND_K = int(os.getenv("GRAPHRAG_EXPAND_K", "20"))
 
-T2C_MAX_ATTEMPTS = int(os.getenv("GRAPHRAG_T2C_MAX_ATTEMPTS", "3"))
-T2C_LIMIT = int(os.getenv("GRAPHRAG_T2C_LIMIT", "50"))
-
 EMBED_MODEL = os.getenv(
     "GRAPHRAG_EMBED_MODEL",
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 )
 EMBED_DEVICE = os.getenv("GRAPHRAG_EMBED_DEVICE", "auto").lower()
 
+TEXT_PROPS = ["Name", "Description", "name", "description"]
+
 
 # =============================================================================
-# Common utilities
+# Neo4j helpers
 # =============================================================================
 
-FORBIDDEN_CYPHER_KEYWORDS = _cget(
-    "FORBIDDEN_CYPHER_KEYWORDS",
-    [
-        "CREATE",
-        "MERGE",
-        "DELETE",
-        "DETACH",
-        "SET",
-        "DROP",
-        "REMOVE",
-        "CALL apoc.",
-        "LOAD CSV",
-        "FOREACH",
-        "GRANT",
-        "REVOKE",
-    ],
-)
-
-_INVALID_LABEL_PIPE_RE = re.compile(r"\([^)]*:\s*`?[\w ]+`?\s*\|", re.IGNORECASE)
-_LIMIT_RE = re.compile(r"\bLIMIT\b\s+(\d+)", re.IGNORECASE)
+def create_driver() -> neo4j.Driver:
+    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 
-def cypher_is_safe_readonly(cypher: str) -> Tuple[bool, str]:
-    up = cypher.upper()
-    for kw in FORBIDDEN_CYPHER_KEYWORDS:
-        if kw.upper() in up:
-            return False, f"Forbidden Cypher keyword detected: {kw}"
-    return True, "ok"
-
-
-def cypher_has_invalid_label_pipe(cypher: str) -> bool:
-    return bool(_INVALID_LABEL_PIPE_RE.search(cypher))
-
-
-def ensure_limit(cypher: str, limit: int) -> str:
-    m = _LIMIT_RE.search(cypher)
-    if not m:
-        return cypher.rstrip().rstrip(";") + f"\nLIMIT {limit}"
-    try:
-        n = int(m.group(1))
-        if n > limit:
-            return _LIMIT_RE.sub(f"LIMIT {limit}", cypher, count=1)
-    except Exception:
-        pass
-    return cypher
-
-
-def looks_like_definition_question(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in ["是什么", "定义", "meaning", "define", "what is", "explain", "介绍"])
-
-
-def lucene_escape(s: str) -> str:
-    return re.sub(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)', r"\\\1", s)
-
-
-def extract_terms(question: str) -> List[str]:
-    # Prefer quoted; otherwise pick longer tokens
-    quoted = []
-    for p in [r'"([^"]+)"', r"'([^']+)'", r"“([^”]+)”", r"「([^」]+)」"]:
-        quoted.extend([t.strip() for t in re.findall(p, question) if t.strip()])
-    if quoted:
-        return quoted[:3]
-
-    cleaned = re.sub(r"[，,。.!?；;:：()\[\]{}<>《》“”‘’\"'`]", " ", question)
-    toks = [t.strip() for t in cleaned.split() if t.strip()]
-    stop = {
-        "是什么",
-        "什么",
-        "解释",
-        "介绍",
-        "请问",
-        "如何",
-        "为什么",
-        "怎么",
-        "定义",
-        "meaning",
-        "define",
-        "explain",
-        "what",
-    }
-    toks = [t for t in toks if t not in stop]
-    toks.sort(key=len, reverse=True)
-    return toks[:3]
-
-
-def neo4j_run(driver: neo4j.Driver, cypher: str, params: Optional[dict] = None) -> List[dict]:
+def neo4j_run(driver: neo4j.Driver, cypher: str, params: Optional[dict] = None, *, database: Optional[str] = None) -> List[dict]:
     params = params or {}
-    records, _, _ = driver.execute_query(cypher, params, database_=NEO4J_DATABASE)
+    records, _, _ = driver.execute_query(
+        cypher,
+        params,
+        database_=(database or NEO4J_DATABASE),
+        routing_=neo4j.RoutingControl.READ,
+    )
     return [dict(r) for r in records]
 
 
@@ -179,9 +91,214 @@ def index_exists(driver: neo4j.Driver, name: str) -> bool:
     return any(r.get("name") == name for r in rows)
 
 
-def create_driver() -> neo4j.Driver:
-    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+# =============================================================================
+# Retrieval tool (keywords -> evidence)
+# =============================================================================
 
+_LUCENE_ESCAPE_RE = re.compile(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)')
+
+
+def lucene_escape(s: str) -> str:
+    return _LUCENE_ESCAPE_RE.sub(r"\\\1", s)
+
+
+def _normalize_keywords(keywords: Any) -> List[str]:
+    """Normalize keywords input from the agent."""
+    if keywords is None:
+        return []
+    if isinstance(keywords, str):
+        kw = keywords.strip()
+        return [kw] if kw else []
+    if isinstance(keywords, list):
+        out: List[str] = []
+        for x in keywords:
+            if x is None:
+                continue
+            t = str(x).strip()
+            if t:
+                out.append(t)
+        return out
+    # fallback
+    t = str(keywords).strip()
+    return [t] if t else []
+
+
+def retrieve_evidence(
+    driver: neo4j.Driver,
+    keywords: Any,
+    *,
+    top_k: int = TOP_K,
+    expand_k: int = EXPAND_K,
+    fulltext_index_name: str = FULLTEXT_INDEX_NAME,
+    database: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
+    """Retrieve evidence given agent-provided keywords.
+
+    Returns (evidence_items, context_text, meta).
+
+    evidence_items item schema matches the web UI:
+      {
+        "cid": "C1",
+        "score": float,
+        "node": {...},
+        "graph": {"nodes":[...], "edges":[...]}
+      }
+
+    context_text:
+      "C1:\nNode(...)\n...\n\nC2:\n..."
+    """
+    kws = _normalize_keywords(keywords)
+    if not kws:
+        return [], "", {"reason": "empty_keywords"}
+
+    db = database or NEO4J_DATABASE
+
+    use_fulltext = False
+    try:
+        use_fulltext = index_exists(driver, fulltext_index_name)
+    except Exception:
+        use_fulltext = False
+
+    lucene = " OR ".join([f'"{lucene_escape(k)}"' for k in kws])
+
+    if use_fulltext:
+        cypher = """
+        CALL db.index.fulltext.queryNodes($index, $q) YIELD node, score
+        WITH node, score ORDER BY score DESC LIMIT $top_k
+        OPTIONAL MATCH (node)-[r]-(m)
+        WITH node, score, collect(DISTINCT {
+          rel_eid: elementId(r),
+          rel_type: type(r),
+          m_eid: elementId(m),
+          m_labels: labels(m),
+          m_name: coalesce(m.Name, m.name, ''),
+          m_desc: coalesce(m.Description, m.description, '')
+        })[0..$k] AS neighbors
+        RETURN
+          elementId(node) AS eid,
+          labels(node) AS labels,
+          coalesce(node.Name, node.name, '') AS name,
+          coalesce(node.Description, node.description, '') AS desc,
+          score AS score,
+          neighbors
+        ORDER BY score DESC
+        """
+        rows = neo4j_run(
+            driver,
+            cypher,
+            {"index": fulltext_index_name, "q": lucene, "top_k": int(top_k), "k": int(expand_k)},
+            database=db,
+        )
+        meta = {"mode": "fulltext", "keywords": kws, "lucene": lucene, "index": fulltext_index_name}
+    else:
+        # Fallback (no index): match by contains on Name/Description (slower, keep LIMIT small).
+        cypher = """
+        WITH $kws AS kws
+        MATCH (n)
+        WHERE any(t IN kws WHERE
+          toLower(coalesce(n.Name, n.name, '')) CONTAINS toLower(t)
+          OR toLower(coalesce(n.Description, n.description, '')) CONTAINS toLower(t)
+        )
+        WITH n LIMIT $top_k
+        OPTIONAL MATCH (n)-[r]-(m)
+        WITH n, collect(DISTINCT {
+          rel_eid: elementId(r),
+          rel_type: type(r),
+          m_eid: elementId(m),
+          m_labels: labels(m),
+          m_name: coalesce(m.Name, m.name, ''),
+          m_desc: coalesce(m.Description, m.description, '')
+        })[0..$k] AS neighbors
+        RETURN
+          elementId(n) AS eid,
+          labels(n) AS labels,
+          coalesce(n.Name, n.name, '') AS name,
+          coalesce(n.Description, n.description, '') AS desc,
+          0.0 AS score,
+          neighbors
+        LIMIT $top_k
+        """
+        rows = neo4j_run(driver, cypher, {"kws": kws, "top_k": int(top_k), "k": int(expand_k)}, database=db)
+        meta = {"mode": "fallback_contains", "keywords": kws, "lucene": lucene, "index_missing": True}
+
+    evidence_items: List[Dict[str, Any]] = []
+    context_chunks: List[str] = []
+
+    for idx, r in enumerate(rows, start=1):
+        cid = f"C{idx}"
+        eid = r.get("eid")
+        labels = r.get("labels") or []
+        name = r.get("name") or ""
+        desc = r.get("desc") or ""
+        score = float(r.get("score") or 0.0)
+        neighbors = r.get("neighbors") or []
+
+        # Build graph elements (nodes + edges)
+        nodes_map: Dict[str, Dict[str, Any]] = {}
+        edges: List[Dict[str, Any]] = []
+
+        def add_node(n_eid: str, n_labels: List[str], n_name: str, n_desc: str):
+            if not n_eid:
+                return
+            if n_eid not in nodes_map:
+                nodes_map[n_eid] = {
+                    "eid": n_eid,
+                    "labels": n_labels,
+                    "name": n_name,
+                    "desc": n_desc,
+                }
+
+        add_node(eid, labels, name, desc)
+
+        for nb in neighbors:
+            m_eid = nb.get("m_eid")
+            m_labels = nb.get("m_labels") or []
+            m_name = nb.get("m_name") or ""
+            m_desc = nb.get("m_desc") or ""
+            add_node(m_eid, m_labels, m_name, m_desc)
+
+            rid = nb.get("rel_eid")
+            rtype = nb.get("rel_type") or ""
+            if rid and eid and m_eid:
+                edges.append({"rid": rid, "type": rtype, "source": eid, "target": m_eid})
+
+        # Context text (for grounding)
+        lines: List[str] = []
+        lines.append(f"{cid}:")
+        lines.append(f"Node(eid={eid}, labels={labels})")
+        if name:
+            lines.append(f"Name: {name}")
+        if desc:
+            lines.append(f"Description: {str(desc)[:1200]}")
+        if neighbors:
+            lines.append("Neighbors (1-hop, sampled):")
+            for nb in neighbors:
+                rel = nb.get("rel_type")
+                nb_labels = nb.get("m_labels")
+                nb_name = nb.get("m_name", "")
+                nb_desc = nb.get("m_desc", "")
+                if isinstance(nb_desc, str) and len(nb_desc) > 300:
+                    nb_desc = nb_desc[:300] + "..."
+                lines.append(f"- {rel} -> (labels={nb_labels}) {nb_name} | {nb_desc}")
+
+        context_chunks.append("\n".join(lines))
+
+        evidence_items.append(
+            {
+                "cid": cid,
+                "score": score,
+                "node": {"eid": eid, "labels": labels, "name": name, "desc": desc},
+                "graph": {"nodes": list(nodes_map.values()), "edges": edges},
+            }
+        )
+
+    context_text = "\n\n".join(context_chunks)
+    return evidence_items, context_text, meta
+
+
+# =============================================================================
+# Index build utilities (CLI/offline) - LAZY imports
+# =============================================================================
 
 def _format_eta(seconds: Optional[float]) -> str:
     if seconds is None or seconds != seconds or seconds < 0 or seconds == float("inf"):
@@ -196,89 +313,13 @@ def _format_eta(seconds: Optional[float]) -> str:
     return f"{s}s"
 
 
-# =============================================================================
-# LLM adapter (Qwen via llama.cpp) for neo4j-graphrag
-# =============================================================================
-
-class QwenLLM(LLMInterfaceV2):
-    """neo4j-graphrag LLM adapter.
-
-    NOTE: This class performs a *lazy import* of qwen.py so that simply importing
-    graphrag.py does NOT import llama_cpp or touch GPU.
-    """
-
-    supports_structured_output: bool = False
-
-    def __init__(self, model_name: str = "qwen-local", model_params: Optional[dict] = None):
-        super().__init__(model_name=model_name, model_params=model_params or {})
-        # Lazy import to avoid server.py importing llama_cpp accidentally.
-        from qwen import LLM_QWEN_Standalone  # local import
-
-        self._qwen = LLM_QWEN_Standalone(verbose=False)
-
-    def get_response(self, messages: List[Dict], think: bool, print_type: str) -> str:
-        return self._qwen.get_response(messages=messages, think=think, print_type=print_type)
-
-    def _to_messages(
-        self,
-        prompt: str,
-        message_history: Optional[List[LLMMessage]] = None,
-        system_instruction: Optional[str] = None,
-    ) -> List[Dict[str, str]]:
-        msgs: List[Dict[str, str]] = []
-        if system_instruction:
-            msgs.append({"role": "system", "content": system_instruction})
-        if message_history:
-            for m in message_history:
-                msgs.append({"role": m.get("role", "user"), "content": m.get("content", "")})
-        msgs.append({"role": "user", "content": prompt})
-        return msgs
-
-    def invoke(
-        self,
-        input: str,
-        message_history: Optional[List[LLMMessage]] = None,
-        system_instruction: Optional[str] = None,
-    ):
-        msgs = self._to_messages(input, message_history=message_history, system_instruction=system_instruction)
-        out = self.get_response(
-            messages=msgs,
-            think=bool(self.model_params.get("think", True)),
-            print_type=str(self.model_params.get("print_type", "stream")),
-        )
-        # neo4j-graphrag expects .content property in return type; use a tiny shim.
-        from neo4j_graphrag.llm.types import LLMResponse  # local import
-
-        return LLMResponse(content=out)
-
-    async def ainvoke(
-        self,
-        input: str,
-        message_history: Optional[List[LLMMessage]] = None,
-        system_instruction: Optional[str] = None,
-    ):
-        return self.invoke(input, message_history=message_history, system_instruction=system_instruction)
-
-
-# =============================================================================
-# Index building (writes)
-# =============================================================================
-
-TEXT_PROPS = ["Name", "Description", "name", "description"]
-
-
 def tag_rag_nodes(
     driver: neo4j.Driver,
     batch_size: int = 10000,
     verbose: bool = False,
     min_print_interval_sec: float = 2.0,
 ) -> int:
-    """Tag nodes that have any non-empty text-ish property with :RAG_LABEL.
-
-    Notes:
-    - For million-scale graphs, doing it in one big transaction can look "stuck".
-      This implementation updates in batches and optionally prints progress + ETA.
-    """
+    """Tag nodes that have any non-empty text-ish property with :RAG_LABEL."""
     cypher = f"""
     MATCH (n)
     WHERE any(p IN $props WHERE n[p] IS NOT NULL AND toString(n[p]) <> '')
@@ -372,7 +413,6 @@ def build_indexes(
     min_print_interval_sec: float = 2.0,
 ) -> int:
     """Ensure :RAG_LABEL exists, create fulltext + vector index if needed. Returns embedding dim."""
-    # Lazy imports to avoid heavy deps unless called
     from neo4j_graphrag.indexes import create_vector_index, create_fulltext_index  # local import
 
     if verbose:
@@ -420,14 +460,6 @@ def build_indexes(
     return dim
 
 
-def make_text_for_embedding(name: str, desc: str) -> str:
-    name = (name or "").strip()
-    desc = (desc or "").strip()
-    if name and desc:
-        return f"{name}\n{desc}"
-    return name or desc
-
-
 def embed_missing_nodes(
     driver: neo4j.Driver,
     embedder,
@@ -437,10 +469,7 @@ def embed_missing_nodes(
     verbose: bool = False,
     min_print_interval_sec: float = 2.0,
 ) -> int:
-    """Compute embeddings for nodes that miss EMBEDDING_PROPERTY (or force).
-
-    For million-scale graphs, this runs in small batches and can optionally print progress + ETA.
-    """
+    """Compute embeddings for nodes that miss EMBEDDING_PROPERTY (or force)."""
     from neo4j_graphrag.indexes import upsert_vectors  # local import
 
     total = 0
@@ -481,7 +510,6 @@ def embed_missing_nodes(
     while True:
         batch += 1
 
-        # LIMIT is computed from remaining max_nodes (if any).
         limit = int(batch_size)
         if max_nodes and (max_nodes - total) < limit:
             limit = max(0, int(max_nodes - total))
@@ -510,15 +538,15 @@ def embed_missing_nodes(
         eids: List[str] = []
         texts: List[str] = []
         for r in rows:
-            txt = make_text_for_embedding(r.get("name", ""), r.get("desc", ""))
-            txt = (txt or "").strip()
+            name = (r.get("name") or "").strip()
+            desc = (r.get("desc") or "").strip()
+            txt = f"{name}\n{desc}".strip()
             if not txt:
                 continue
             eids.append(r["eid"])
             texts.append(txt)
 
         if not eids:
-            # Should be rare due to query-level filter; continue to next batch to avoid stopping early.
             continue
 
         # Embed
@@ -572,426 +600,6 @@ def embed_missing_nodes(
     return total
 
 
-# =============================================================================
-# Retriever: Hybrid (vector+fulltext) + 1-hop expansion
-# =============================================================================
-
-class HybridNeighborhoodRetriever(Retriever):
-    VERIFY_NEO4J_VERSION = False
-
-    def __init__(self, driver: neo4j.Driver, hybrid, expand_k: int = EXPAND_K, neo4j_database: Optional[str] = None) -> None:
-        super().__init__(driver=driver, neo4j_database=neo4j_database or NEO4J_DATABASE)
-        self.hybrid = hybrid
-        self.expand_k = expand_k
-
-    def _expand_neighbors(self, eids: List[str]) -> Dict[str, dict]:
-        cypher = f"""
-        UNWIND $eids AS eid
-        MATCH (n) WHERE elementId(n) = eid
-        OPTIONAL MATCH (n)-[r]-(m)
-        WITH eid, n, collect(DISTINCT {{
-          rel_type: type(r),
-          rel_eid: elementId(r),
-          m_eid: elementId(m),
-          m_labels: labels(m),
-          m_name: coalesce(m.Name, m.name, ''),
-          m_desc: coalesce(m.Description, m.description, '')
-        }})[0..$k] AS neighbors
-        RETURN
-          eid,
-          labels(n) AS n_labels,
-          coalesce(n.Name, n.name, '') AS n_name,
-          coalesce(n.Description, n.description, '') AS n_desc,
-          neighbors
-        """
-        rows = neo4j_run(self.driver, cypher, {"eids": eids, "k": int(self.expand_k)})
-        return {r["eid"]: r for r in rows}
-
-    def get_search_results(self, query_text: str, top_k: int = TOP_K, **kwargs: Any) -> RawSearchResult:
-        return self.hybrid.get_search_results(query_text=query_text, top_k=top_k)
-
-    def search(self, query_text: str, top_k: int = TOP_K, **kwargs: Any) -> RetrieverResult:
-        raw = self.hybrid.get_search_results(query_text=query_text, top_k=top_k)
-
-        hits: List[Tuple[str, float]] = []
-        for rec in raw.records:
-            node = rec.get("node")
-            score = rec.get("score")
-            eid = getattr(node, "element_id", None)
-            if eid is None:
-                eid = rec.get("id") or rec.get("eid")
-            if not isinstance(eid, str):
-                continue
-            hits.append((eid, float(score) if score is not None else 0.0))
-
-        if not hits:
-            return RetrieverResult(items=[], metadata={"__retriever": "HybridNeighborhoodRetriever", "raw_metadata": raw.metadata})
-
-        expansions = self._expand_neighbors([h[0] for h in hits])
-
-        items: List[RetrieverResultItem] = []
-        for eid, score in hits:
-            exp = expansions.get(eid, {})
-            name = exp.get("n_name", "")
-            desc = exp.get("n_desc", "")
-            labels = exp.get("n_labels", [])
-            neighbors = exp.get("neighbors", []) or []
-
-            lines = []
-            lines.append(f"Node(eid={eid}, labels={labels})")
-            if name:
-                lines.append(f"Name: {name}")
-            if desc:
-                lines.append(f"Description: {str(desc)[:1200]}")
-            if neighbors:
-                lines.append("Neighbors (1-hop, sampled):")
-                for nb in neighbors:
-                    rel = nb.get("rel_type")
-                    nb_labels = nb.get("m_labels")
-                    nb_name = nb.get("m_name", "")
-                    nb_desc = nb.get("m_desc", "")
-                    nb_desc = (nb_desc[:300] + "...") if isinstance(nb_desc, str) and len(nb_desc) > 300 else nb_desc
-                    lines.append(f"- {rel} -> (labels={nb_labels}) {nb_name} | {nb_desc}")
-
-            items.append(
-                RetrieverResultItem(
-                    content="\n".join(lines),
-                    metadata={
-                        "score": score,
-                        "eid": eid,
-                        "name": name,
-                        "labels": labels,
-                        "desc": desc,
-                        "neighbors": neighbors,
-                        "retriever": "HybridNeighborhoodRetriever",
-                    },
-                )
-            )
-
-        return RetrieverResult(items=items, metadata={"__retriever": "HybridNeighborhoodRetriever", "raw_metadata": raw.metadata})
-
-
-# =============================================================================
-# Robust Text2Cypher fallback (read-only + retry)
-# =============================================================================
-
-@dataclass
-class Text2CypherAttempt:
-    attempt: int
-    prompt: str
-    cypher: str
-    error: Optional[str] = None
-
-
-class RobustText2CypherRetriever(Retriever):
-    VERIFY_NEO4J_VERSION = False
-
-    def __init__(
-        self,
-        driver: neo4j.Driver,
-        llm: LLMInterfaceV2,
-        neo4j_schema: Optional[str] = None,
-        max_attempts: int = T2C_MAX_ATTEMPTS,
-        limit: int = T2C_LIMIT,
-        neo4j_database: Optional[str] = None,
-    ):
-        super().__init__(driver=driver, neo4j_database=neo4j_database or NEO4J_DATABASE)
-        self.llm = llm
-        self.max_attempts = max_attempts
-        self.limit = limit
-
-        if neo4j_schema is None:
-            try:
-                neo4j_schema = get_schema(driver)
-            except Exception:
-                neo4j_schema = "(schema unavailable)"
-        self.neo4j_schema = neo4j_schema
-
-        self.prompt_template = Text2CypherTemplate(
-            template=r"""
-Task: Generate a Cypher statement for querying a Neo4j graph database from a user input.
-
-Schema:
-{schema}
-
-IMPORTANT RULES (MUST FOLLOW):
-1) Read-only ONLY. Do NOT use CREATE/MERGE/DELETE/SET/DROP/REMOVE/LOAD CSV/CALL apoc.*.
-2) Always return a SMALL result set: include "LIMIT {limit}" (or smaller).
-3) Do NOT use "(:Label1|Label2)" in MATCH node patterns. Neo4j MATCH does not support label OR with '|'.
-   If you must match multiple labels, use:
-   - MATCH (n) WHERE n:Label1 OR n:Label2 ...
-   - or UNION.
-4) Prefer using properties that exist in schema. Use coalesce() to handle missing properties safely.
-
-Input:
-{query_text}
-
-Return ONLY the Cypher statement, without triple backticks or any other text.
-Cypher query:
-Examples (may be empty):
-{examples}
-
-""".strip(),
-            expected_inputs=["schema", "query_text", "limit"],
-        )
-
-    def _build_prompt(self, query_text: str, extra: str = "") -> str:
-        base = self.prompt_template.format(schema=self.neo4j_schema, query_text=query_text, limit=str(self.limit))
-        return base + ("\n\n" + extra.strip() if extra else "")
-
-    def _generate_cypher(self, prompt: str) -> str:
-        cypher = self.llm.invoke(prompt).content.strip()
-        cypher = ensure_limit(cypher, self.limit)
-        ok, msg = cypher_is_safe_readonly(cypher)
-        if not ok:
-            raise ValueError(msg)
-        if cypher_has_invalid_label_pipe(cypher):
-            raise ValueError("Invalid label OR syntax detected (use WHERE ... OR ... instead of :A|B in MATCH).")
-        return cypher
-
-    def get_search_results(self, query_text: str) -> RawSearchResult:
-        attempts: List[Text2CypherAttempt] = []
-        last_error: Optional[str] = None
-
-        for i in range(1, self.max_attempts + 1):
-            extra = ""
-            if last_error:
-                extra = (
-                    "The previous Cypher failed. Fix the query.\n"
-                    f"Error:\n{last_error}\n"
-                    "Return ONLY the corrected Cypher.\n"
-                )
-            prompt = self._build_prompt(query_text, extra=extra)
-            try:
-                cypher = self._generate_cypher(prompt)
-                records, _, _ = self.driver.execute_query(
-                    cypher,
-                    {},
-                    database_=self.neo4j_database,
-                    routing_=neo4j.RoutingControl.READ,
-                )
-                attempts.append(Text2CypherAttempt(attempt=i, prompt=prompt, cypher=cypher))
-                return RawSearchResult(
-                    records=records,
-                    metadata={"mode": "text2cypher", "cypher": cypher, "attempts": [a.__dict__ for a in attempts]},
-                )
-            except (CypherSyntaxError, Neo4jError, ValueError) as e:
-                err_msg = getattr(e, "message", None) or str(e)
-                last_error = err_msg
-                attempts.append(Text2CypherAttempt(attempt=i, prompt=prompt, cypher="", error=last_error))
-                continue
-
-        return RawSearchResult(
-            records=[],
-            metadata={"mode": "text2cypher", "error": last_error, "attempts": [a.__dict__ for a in attempts]},
-        )
-
-    def default_record_formatter(self, record: neo4j.Record) -> RetrieverResultItem:
-        return RetrieverResultItem(content=json.dumps(dict(record), ensure_ascii=False), metadata={"retriever": "RobustText2CypherRetriever"})
-
-
-# =============================================================================
-# Safe Fulltext fallback (handles Lucene special chars better for entity names)
-# =============================================================================
-
-class SafeFulltextNeighborhoodRetriever(Retriever):
-    VERIFY_NEO4J_VERSION = False
-
-    def __init__(self, driver: neo4j.Driver, fulltext_index_name: str, expand_k: int = EXPAND_K):
-        super().__init__(driver=driver, neo4j_database=NEO4J_DATABASE)
-        self.fulltext_index_name = fulltext_index_name
-        self.expand_k = expand_k
-
-    def get_search_results(self, query_text: str, top_k: int = TOP_K, **kwargs: Any) -> RawSearchResult:
-        terms = extract_terms(query_text)
-        if not terms:
-            return RawSearchResult(records=[], metadata={"mode": "safe_fulltext", "terms": []})
-        lucene = " OR ".join([f'"{lucene_escape(t)}"' for t in terms])
-        cypher = f"""
-        CALL db.index.fulltext.queryNodes($index, $q) YIELD node, score
-        WITH node, score ORDER BY score DESC LIMIT $top_k
-        OPTIONAL MATCH (node)-[r]-(m)
-        WITH node, score, collect(DISTINCT {{
-          rel_type: type(r),
-          rel_eid: elementId(r),
-          m_eid: elementId(m),
-          m_labels: labels(m),
-          m_name: coalesce(m.Name, m.name, ''),
-          m_desc: coalesce(m.Description, m.description, '')
-        }})[0..$k] AS neighbors
-        RETURN
-          elementId(node) AS eid,
-          labels(node) AS labels,
-          coalesce(node.Name, node.name, '') AS name,
-          coalesce(node.Description, node.description, '') AS desc,
-          score AS score,
-          neighbors
-        ORDER BY score DESC
-        """
-        records, _, _ = self.driver.execute_query(
-            cypher,
-            {"index": self.fulltext_index_name, "q": lucene, "top_k": top_k, "k": int(self.expand_k)},
-            database_=self.neo4j_database,
-            routing_=neo4j.RoutingControl.READ,
-        )
-        return RawSearchResult(records=records, metadata={"mode": "safe_fulltext", "terms": terms, "lucene": lucene})
-
-    def default_record_formatter(self, record: neo4j.Record) -> RetrieverResultItem:
-        eid = record.get("eid")
-        labels = record.get("labels")
-        name = record.get("name")
-        desc = record.get("desc")
-        score = record.get("score")
-        neighbors = record.get("neighbors") or []
-        lines = []
-        lines.append(f"Node(eid={eid}, labels={labels})")
-        if name:
-            lines.append(f"Name: {name}")
-        if desc:
-            lines.append(f"Description: {str(desc)[:1200]}")
-        if neighbors:
-            lines.append("Neighbors (1-hop, sampled):")
-            for nb in neighbors:
-                rel = nb.get("rel_type")
-                nb_labels = nb.get("m_labels")
-                nb_name = nb.get("m_name", "")
-                nb_desc = nb.get("m_desc", "")
-                nb_desc = (nb_desc[:300] + "...") if isinstance(nb_desc, str) and len(nb_desc) > 300 else nb_desc
-                lines.append(f"- {rel} -> (labels={nb_labels}) {nb_name} | {nb_desc}")
-        return RetrieverResultItem(
-            content="\n".join(lines),
-            metadata={
-                "score": score,
-                "eid": eid,
-                "labels": labels,
-                "name": name,
-                "desc": desc,
-                "neighbors": neighbors,
-                "retriever": "SafeFulltextNeighborhoodRetriever",
-            },
-        )
-
-
-# =============================================================================
-# Composite Retriever: Hybrid -> Fulltext (if needed) -> Text2Cypher
-# =============================================================================
-
-class CompositeRetriever(Retriever):
-    VERIFY_NEO4J_VERSION = False
-
-    def __init__(self, driver: neo4j.Driver, hybrid_nb: Optional[HybridNeighborhoodRetriever], safe_ft: SafeFulltextNeighborhoodRetriever, t2c: RobustText2CypherRetriever):
-        super().__init__(driver=driver, neo4j_database=NEO4J_DATABASE)
-        self.hybrid_nb = hybrid_nb
-        self.safe_ft = safe_ft
-        self.t2c = t2c
-
-    def get_search_results(self, *args: Any, **kwargs: Any) -> RawSearchResult:
-        return RawSearchResult(records=[], metadata={})
-
-    def search(self, query_text: str, top_k: int = TOP_K, **kwargs: Any) -> RetrieverResult:
-        meta: Dict[str, Any] = {"router": "hybrid->fulltext->t2c"}
-        items: List[RetrieverResultItem] = []
-
-        if self.hybrid_nb is not None:
-            try:
-                r1 = self.hybrid_nb.search(query_text=query_text, top_k=top_k)
-                meta["hybrid"] = r1.metadata
-                items.extend(r1.items)
-            except Exception as e:
-                meta["hybrid_error"] = str(e)
-
-        if looks_like_definition_question(query_text) or len(items) == 0:
-            r2 = self.safe_ft.search(query_text=query_text, top_k=top_k)
-            meta["fulltext"] = r2.metadata
-            existing = {it.content for it in items}
-            for it in r2.items:
-                if it.content not in existing:
-                    items.append(it)
-                    existing.add(it.content)
-
-        if len(items) == 0:
-            r3 = self.t2c.search(query_text=query_text)
-            meta["t2c"] = r3.metadata
-            items.extend(r3.items)
-
-        numbered: List[RetrieverResultItem] = []
-        for i, it in enumerate(items, start=1):
-            numbered.append(RetrieverResultItem(content=f"C{i}:\n{it.content}", metadata=it.metadata))
-
-        return RetrieverResult(items=numbered, metadata=meta)
-
-
-# =============================================================================
-# Answer prompt (grounded)
-# =============================================================================
-
-ANSWER_PROMPT = RagTemplate(
-    template=r"""
-你是一个严谨的助手。只能使用下面提供的 Context 来回答问题：
-- 如果 Context 信息不足，请明确说“资料不足，无法确定”，并说明缺了什么。
-- 每当你引用 Context 中的事实，都要用 [C1] [C2] 这样的引用标注。
-- 不要编造任何 Context 中不存在的细节。
-
-
-Examples (may be empty):
-{examples}
-
-Context:
-{context}
-
-Question:
-{query_text}
-
-Answer:
-""".strip(),
-    expected_inputs=["context", "query_text", "examples"],
-    system_instructions="You are a careful assistant that strictly grounds answers in the provided context.",
-)
-
-
-# =============================================================================
-# GraphRAG builder (CLI usage)
-# =============================================================================
-
-def build_retriever(driver: neo4j.Driver, enable_hybrid: bool = True) -> CompositeRetriever:
-    """Build the CompositeRetriever used by CLI test.py."""
-    llm = QwenLLM(model_name="qwen-local")
-
-    try:
-        schema = get_schema(driver)
-    except Exception:
-        schema = None
-
-    t2c = RobustText2CypherRetriever(driver=driver, llm=llm, neo4j_schema=schema)
-
-    safe_ft = SafeFulltextNeighborhoodRetriever(driver, FULLTEXT_INDEX_NAME, expand_k=EXPAND_K)
-
-    hybrid_nb: Optional[HybridNeighborhoodRetriever] = None
-    if enable_hybrid and index_exists(driver, VECTOR_INDEX_NAME) and index_exists(driver, FULLTEXT_INDEX_NAME):
-        try:
-            # Lazy import embedder + official hybrid retriever
-            from neo4j_graphrag.retrievers import HybridRetriever  # local import
-
-            embedder = make_embedder()
-            hybrid = HybridRetriever(
-                driver,
-                VECTOR_INDEX_NAME,
-                FULLTEXT_INDEX_NAME,
-                embedder=embedder,
-                neo4j_database=NEO4J_DATABASE,
-            )
-            hybrid_nb = HybridNeighborhoodRetriever(driver=driver, hybrid=hybrid, expand_k=EXPAND_K, neo4j_database=NEO4J_DATABASE)
-        except Exception:
-            # Degrade gracefully if embeddings stack isn't installed
-            hybrid_nb = None
-
-    return CompositeRetriever(driver=driver, hybrid_nb=hybrid_nb, safe_ft=safe_ft, t2c=t2c)
-
-
-def build_prompt(context: str, question: str) -> str:
-    return ANSWER_PROMPT.format(context=context, query_text=question, examples="")
-
-
 def ensure_fulltext_index(driver: neo4j.Driver) -> None:
     """Best-effort ensure the fulltext index exists (writes)."""
     try:
@@ -1008,5 +616,5 @@ def ensure_fulltext_index(driver: neo4j.Driver) -> None:
                 neo4j_database=NEO4J_DATABASE,
             )
     except Exception:
-        # Keep silent; CLI can still run with text2cypher fallback
+        # Keep silent; retrieval can still work via fallback contains-search.
         pass

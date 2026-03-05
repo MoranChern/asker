@@ -26,7 +26,7 @@ FORBIDDEN_CYPHER_KEYWORDS = [
 # Qwen / llama.cpp runtime config
 # -------------------------
 # GPU selection for llama-cpp (set to None to not set env var)
-CUDA_VISIBLE_DEVICES = "0,1,2"
+CUDA_VISIBLE_DEVICES = "2,3"
 
 # Model path (GGUF)
 GENERAL_MODEL_PATH = "/models/Qwen3-32B-GGUF/Qwen3-32B-Q6_K.gguf"
