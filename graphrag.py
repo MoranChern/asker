@@ -86,9 +86,88 @@ def neo4j_run(driver: neo4j.Driver, cypher: str, params: Optional[dict] = None, 
     return [dict(r) for r in records]
 
 
+def neo4j_write(driver: neo4j.Driver, cypher: str, params: Optional[dict] = None, *, database: Optional[str] = None) -> List[dict]:
+    params = params or {}
+    records, _, _ = driver.execute_query(
+        cypher,
+        params,
+        database_=(database or NEO4J_DATABASE),
+        routing_=neo4j.RoutingControl.WRITE,
+    )
+    return [dict(r) for r in records]
+
+
 def index_exists(driver: neo4j.Driver, name: str) -> bool:
     rows = neo4j_run(driver, "SHOW INDEXES YIELD name RETURN name")
     return any(r.get("name") == name for r in rows)
+
+
+def list_indexes(driver: neo4j.Driver, *, database: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List indexes in the target database.
+
+    Returns a simplified JSON-friendly structure for CLI display / cleanup logic.
+    """
+    rows = neo4j_run(
+        driver,
+        """
+        SHOW INDEXES
+        YIELD name, type, entityType, labelsOrTypes, properties, state, owningConstraint
+        RETURN name, type, entityType, labelsOrTypes, properties, state, owningConstraint
+        ORDER BY name
+        """,
+        database=database,
+    )
+    return [
+        {
+            "name": r.get("name"),
+            "type": r.get("type"),
+            "entityType": r.get("entityType"),
+            "labelsOrTypes": r.get("labelsOrTypes") or [],
+            "properties": r.get("properties") or [],
+            "state": r.get("state"),
+            "owningConstraint": r.get("owningConstraint"),
+        }
+        for r in rows
+    ]
+
+
+def drop_all_indexes(
+    driver: neo4j.Driver,
+    *,
+    database: Optional[str] = None,
+    include_constraint_owned: bool = False,
+    verbose: bool = False,
+) -> List[str]:
+    """Drop all droppable indexes in the target database.
+
+    Notes:
+    - By default, indexes owned by constraints are skipped to avoid breaking constraints.
+    - Returns the list of dropped index names.
+    """
+    db = database or NEO4J_DATABASE
+    indexes = list_indexes(driver, database=db)
+    dropped: List[str] = []
+
+    for idx in indexes:
+        name = idx.get("name")
+        owning_constraint = idx.get("owningConstraint")
+        if not name:
+            continue
+        if owning_constraint and not include_constraint_owned:
+            if verbose:
+                print(f"[drop] skip constraint-owned index: {name} (constraint={owning_constraint})", flush=True)
+            continue
+
+        cypher = f"DROP INDEX `{str(name).replace('`', '``')}` IF EXISTS"
+        neo4j_write(driver, cypher, database=db)
+        dropped.append(str(name))
+        if verbose:
+            print(f"[drop] dropped index: {name}", flush=True)
+
+    if verbose:
+        print(f"[drop] done dropped={len(dropped)} db={db}", flush=True)
+
+    return dropped
 
 
 # =============================================================================
@@ -357,7 +436,7 @@ def tag_rag_nodes(
 
     while True:
         batch += 1
-        rows = neo4j_run(driver, cypher, {"props": TEXT_PROPS, "limit": int(batch_size)})
+        rows = neo4j_write(driver, cypher, {"props": TEXT_PROPS, "limit": int(batch_size)})
         tagged = int(rows[0]["tagged"]) if rows else 0
         if tagged <= 0:
             break
