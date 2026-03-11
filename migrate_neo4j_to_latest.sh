@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+
+# 执行之前要做的：
+# 1)确认docker已经关闭
+# 2)把马俊龙目录的neo4j转移到此目录，不要重命名（还叫neo4j）
+
+# 如果执行成功，应该能看到在结尾处输出[migrate] DONE.
+
 set -euo pipefail
 
 # ===================== Config =====================
@@ -10,9 +17,10 @@ NEW_IMAGE="neo4j:2026.01.4-community"
 
 COMPOSE_FILE="docker-compose.yml"
 SERVICE_NAME="kg-neo4j"
+TEMP_COMPOSE_BAK="${COMPOSE_FILE}.bak"
 
 OLD_DATA_DIR="./neo4j/data"
-NEW_DATA_DIR="./neo4j/data_2026"
+NEW_DATA_DIR="./neo_data"
 
 BACKUP_ROOT="./neo4j/migration_backups"
 
@@ -80,13 +88,27 @@ try_dump_from_dir() {
   local dump_file="$3"
   local backups_dir="$4"
 
+  local src_mount
+  if [[ "$src_dir" = /* ]]; then
+    src_mount="$src_dir"
+  else
+    src_mount="$(pwd)/${src_dir#./}"
+  fi
+
+  local backups_mount
+  if [[ "$backups_dir" = /* ]]; then
+    backups_mount="$backups_dir"
+  else
+    backups_mount="$(pwd)/${backups_dir#./}"
+  fi
+
   log "Trying dump as user ${uidgid} from ${src_dir} (RW mount) ..."
   set +e
   docker run --rm -i \
     -u "${uidgid}" \
     --entrypoint=neo4j-admin \
-    -v "$(pwd)/${src_dir#./}:/data" \
-    -v "$(pwd)/${backups_dir#./}:/backups" \
+    -v "${src_mount}:/data" \
+    -v "${backups_mount}:/backups" \
     "${OLD_IMAGE}" \
     dump --database="${DB_NAME}" --to="/backups/${DB_NAME}.dump"
   local rc=$?
@@ -112,45 +134,42 @@ snapshot_to_local_tmp() {
     -c 'cd /src && tar cf - . | (cd /dst && tar xpf - --no-same-owner)'
 }
 
-patch_compose_inplace() {
-  local compose_path="$1"
-  local backup_path="$2"
-  local new_image="$3"
-  local old_data="$4"
-  local new_data="$5"
+write_temp_compose_file() {
+  cp -f "${COMPOSE_FILE}" "${TEMP_COMPOSE_BAK}"
+  log "Backed up ${COMPOSE_FILE} -> ${TEMP_COMPOSE_BAK}"
 
-  cp -f "$compose_path" "$backup_path"
-  log "Backed up ${compose_path} -> ${backup_path}"
+  cat > "${COMPOSE_FILE}" <<'YAML'
+# 知识图谱项目
+version: '3'
+services:
+  kg-neo4j:
+    image: neo4j:4.4.11-community
+    # build: ./neo4j
+    ports:
+      - '7473:7473'
+      - '7474:7474'
+      - '7687:7687'
+    environment:
+      - NEO4J_AUTH=neo4j/1kcsy2C7Vrn9JHuh
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=4G
+      - NEO4J_dbms_memory_pagecache_size=1G
+      - NEO4J_dbms_default__listen__address=0.0.0.0
+    volumes:
+      - ./neo4j/data:/var/lib/neo4j/data
+    stdin_open: true
+    tty: true
+YAML
 
-  python3 - "$compose_path" "$new_image" "$old_data" "$new_data" <<'PY'
-import sys, re
-compose_path = sys.argv[1]
-new_image    = sys.argv[2]
-old_data     = sys.argv[3]
-new_data     = sys.argv[4]
+  log "Temporary ${COMPOSE_FILE} written."
+}
 
-txt = open(compose_path, "r", encoding="utf-8").read()
-m = re.search(r'(?ms)^(\s*)kg-neo4j:\s*\n(.*?)(?=^\1\S|\Z)', txt)
-if not m:
-    raise SystemExit("Could not find service block: kg-neo4j")
-
-indent = m.group(1)
-block  = m.group(0)
-
-img_line_re = re.compile(r'(?m)^' + re.escape(indent) + r'\s+image:\s*.*$')
-if img_line_re.search(block):
-    block = img_line_re.sub(indent + "  image: " + new_image, block, count=1)
-else:
-    block = block.replace(indent + "kg-neo4j:\n",
-                          indent + "kg-neo4j:\n" + indent + "  image: " + new_image + "\n",
-                          1)
-
-block = re.sub(re.escape(old_data) + r'(?=:/data\b)', new_data, block)
-
-txt2 = txt[:m.start()] + block + txt[m.end():]
-open(compose_path, "w", encoding="utf-8").write(txt2)
-print("Compose patched: kg-neo4j image + /data volume updated.")
-PY
+restore_temp_compose_file() {
+  if [[ -f "${TEMP_COMPOSE_BAK}" ]]; then
+    rm -f "${COMPOSE_FILE}"
+    mv -f "${TEMP_COMPOSE_BAK}" "${COMPOSE_FILE}"
+    log "Restored original ${COMPOSE_FILE}"
+  fi
 }
 
 main() {
@@ -160,12 +179,14 @@ main() {
 
   [[ -d "${OLD_DATA_DIR}" ]] || die "Old data directory not found: ${OLD_DATA_DIR}"
 
-  local ts run_dir backups_dir dump_file compose_bak
+  write_temp_compose_file
+  trap restore_temp_compose_file EXIT
+
+  local ts run_dir backups_dir dump_file
   ts="$(date +%Y%m%d_%H%M%S)"
   run_dir="${BACKUP_ROOT}/${ts}"
   backups_dir="${run_dir}/backups"
   dump_file="${backups_dir}/${DB_NAME}.dump"
-  compose_bak="${run_dir}/docker-compose.yml.bak"
 
   log "This will migrate Neo4j data:"
   log "  ${OLD_IMAGE} -> ${HOP_IMAGE} -> ${NEW_IMAGE}"
@@ -289,17 +310,17 @@ To re-run: move/delete it (it's the *new* dir), then run again."
 
   chmod -R a+rwx "${NEW_DATA_DIR}" >/dev/null 2>&1 || true
 
-  # ---- 4) Patch compose + start latest ----
-  log "Patching ${COMPOSE_FILE}: set image=${NEW_IMAGE}, volume ${NEW_DATA_DIR}:/data for ${SERVICE_NAME}"
-  patch_compose_inplace "${COMPOSE_FILE}" "${compose_bak}" "${NEW_IMAGE}" "${OLD_DATA_DIR}" "${NEW_DATA_DIR}"
+  # ---- 4) Restore original compose + start final service ----
+  log "Restoring original ${COMPOSE_FILE} before starting final service..."
+  restore_temp_compose_file
+  trap - EXIT
 
   log "Starting only ${SERVICE_NAME}..."
-  compose up -d "${SERVICE_NAME}"
+  # compose up -d "${SERVICE_NAME}"
 
   echo
   log "DONE."
   log "Dump: ${dump_file}"
-  log "Compose backup: ${compose_bak}"
   log "New data dir: ${NEW_DATA_DIR}"
   if [[ -n "${snapshot_dir}" ]]; then
     log "Snapshot dir (if created): ${snapshot_dir}"
