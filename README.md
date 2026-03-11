@@ -1,20 +1,31 @@
-# 项目组件
+# GraphRAG WebApp (split + streaming UI)
 
-- `server.py`：Web 端主程序。
-- `local_client.py`：本地命令行对话主程序。
-- `index_manager.py`：索引管理程序。
-- `graphrag.py`：图检索与图数据库处理模块。
-- `agent.py`：对话代理模块。
-- `gpu_worker.py`：GPU 工作模块。
-- `qwen.py`：模型接入模块。
-- `constants.py`：常量与配置模块。
-- `static/`：静态资源目录。
+## 1) 文件结构
 
-# 需要删除数据库时
+- `graphrag.py`：GraphRAG 业务逻辑（检索、索引、Prompt、Retriever…）
+- `local_client.py`：CLI 主程序逻辑（原 graphrag_app 的 main loop）
+- `server.py`：Web 后端（FastAPI + WebSocket）
+- `gpu_worker.py`：短生命周期 GPU 进程（llama.cpp/Qwen 推理 + JSONL 流式输出）
+- `static/`：前端页面（滚动流 + 三种块 + Cytoscape 图谱证据）
 
-- 首先，确认docker已经down掉
-- 然后使用下面的命令删除
+## 2) CLI 运行
 
 ```bash
-docker run --rm -u 0:0 -v "$HOME/asker:/work" --entrypoint bash neo4j:4.4.11-community -lc 'rm -rf /work/neo_data'
+python local_client.py
+# 或构建索引/向量（写入 Neo4j）
+python local_client.py --build-index
 ```
+
+## 3) Web 运行
+
+```bash
+python server.py
+# 浏览器打开 http://localhost:8000
+```
+
+## 4) 说明
+
+- server 进程本身不 import `llama_cpp`，不会触碰 GPU。
+- 每次回答会启动一次 `gpu_worker.py`，结束即退出释放显存。
+- 证据以小图谱展示；点击节点/边会调用 `/api/node/{eid}` 或 `/api/rel/{rid}` 查看字段。
+- Ctrl+Enter 发送；发送后输入块变提问块，下方生成回答块；回答结束后自动追加新的输入块。
