@@ -62,8 +62,7 @@ SERVER_WORKER_TERMINATE_TIMEOUT_SEC = 2.0
 SERVER_WORKER_KILL_TIMEOUT_SEC = 2.0
 
 # -------------------------
-# Server retrieval config
+# Server retrieval config (no index)
 # -------------------------
-SERVER_FULLTEXT_INDEX_NAME = "graphrag_fulltext_rag"
 SERVER_TOP_K = 8
 SERVER_EXPAND_K = 20

@@ -19,7 +19,6 @@ function scrollToBottom() {
 }
 
 function renderMarkdown(el, mdText) {
-  // Final answer text is Markdown; render it to HTML for display.
   const markedLib = window.marked;
   if (!markedLib) {
     el.textContent = mdText;
@@ -32,20 +31,19 @@ function renderMarkdown(el, mdText) {
   el.innerHTML = html;
 }
 
-
 function enableAutoResizeTextarea(ta) {
   if (!ta) return;
 
   const resize = () => {
-    // Reset first so it can shrink when text is deleted.
     ta.style.height = "auto";
     ta.style.height = `${ta.scrollHeight}px`;
   };
 
   let composing = false;
 
-  // Better behavior for Chinese/IME input.
-  ta.addEventListener("compositionstart", () => { composing = true; });
+  ta.addEventListener("compositionstart", () => {
+    composing = true;
+  });
   ta.addEventListener("compositionend", () => {
     composing = false;
     requestAnimationFrame(resize);
@@ -56,10 +54,8 @@ function enableAutoResizeTextarea(ta) {
     requestAnimationFrame(resize);
   });
 
-  // Init (covers default value / first render)
   requestAnimationFrame(resize);
 }
-
 
 function mkBlock(type) {
   const div = document.createElement("div");
@@ -70,21 +66,11 @@ function mkBlock(type) {
 function mkInputBlock() {
   const b = mkBlock("input");
 
-  // const title = document.createElement("div");
-  // title.className = "title";
-  // title.textContent = "Input";
-  // b.appendChild(title);
-
   const ta = document.createElement("textarea");
   ta.placeholder = "输入问题，Ctrl+Enter 发送";
   b.appendChild(ta);
 
   enableAutoResizeTextarea(ta);
-
-  // const hint = document.createElement("div");
-  // hint.className = "hint";
-  // hint.textContent = "快捷键：Ctrl+Enter 发送";
-  // b.appendChild(hint);
 
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && e.ctrlKey) {
@@ -95,7 +81,6 @@ function mkInputBlock() {
     }
   });
 
-  // autofocus
   setTimeout(() => ta.focus(), 50);
 
   return b;
@@ -127,12 +112,24 @@ function mkAnswerBlock() {
   thinkingDetails.open = true;
 
   const thinkingSummary = document.createElement("summary");
-  thinkingSummary.textContent = "Thinking";
+  thinkingSummary.textContent = "Model Thinking";
   thinkingDetails.appendChild(thinkingSummary);
 
   const thinkingPre = document.createElement("pre");
   thinkingPre.dataset.role = "thinking";
   thinkingDetails.appendChild(thinkingPre);
+
+  const statusDetails = document.createElement("details");
+  statusDetails.className = "section";
+  statusDetails.open = true;
+
+  const statusSummary = document.createElement("summary");
+  statusSummary.textContent = "Status / Logs";
+  statusDetails.appendChild(statusSummary);
+
+  const statusPre = document.createElement("pre");
+  statusPre.dataset.role = "status";
+  statusDetails.appendChild(statusPre);
 
   const evidenceDetails = document.createElement("details");
   evidenceDetails.className = "section";
@@ -160,10 +157,20 @@ function mkAnswerBlock() {
   finalSection.appendChild(finalText);
 
   b.appendChild(thinkingDetails);
+  b.appendChild(statusDetails);
   b.appendChild(evidenceDetails);
   b.appendChild(finalSection);
 
-  return { block: b, thinkingDetails, evidenceDetails, thinkingPre, evidenceList, finalText };
+  return {
+    block: b,
+    thinkingDetails,
+    thinkingPre,
+    statusDetails,
+    statusPre,
+    evidenceDetails,
+    evidenceList,
+    finalText,
+  };
 }
 
 function renderEvidenceItem(item, evidenceList) {
@@ -181,7 +188,6 @@ function renderEvidenceItem(item, evidenceList) {
 
   evidenceList.appendChild(wrap);
 
-  // Cytoscape elements
   const nodes = (item.graph?.nodes ?? []).map((n) => ({
     data: {
       id: n.eid,
@@ -210,29 +216,29 @@ function renderEvidenceItem(item, evidenceList) {
       {
         selector: "node",
         style: {
-          "label": "data(label)",
+          label: "data(label)",
           "font-size": 10,
           "text-wrap": "wrap",
           "text-max-width": 56,
           "text-valign": "center",
           "text-halign": "center",
           "background-color": "#2b7cff",
-          "color": "#111",
+          color: "#111",
           "border-width": 1,
           "border-color": "#111",
-          "shape": "ellipse",
-          "width": 60,
-          "height": 60,
+          shape: "ellipse",
+          width: 60,
+          height: 60,
         },
       },
       {
         selector: "edge",
         style: {
-          "label": "data(label)",
+          label: "data(label)",
           "font-size": 9,
           "curve-style": "bezier",
           "target-arrow-shape": "triangle",
-          "width": 1.5,
+          width: 1.5,
           "line-color": "#333",
           "target-arrow-color": "#333",
           "text-background-opacity": 1,
@@ -280,7 +286,6 @@ function connectWS() {
 
   ws.onclose = () => {
     wsReady = false;
-    // auto reconnect
     setTimeout(connectWS, 1000);
   };
 
@@ -290,58 +295,56 @@ function connectWS() {
     try {
       msg = JSON.parse(ev.data);
     } catch {
-      msg = { type: "thinking", text: ev.data };
+      msg = { type: "status", text: ev.data };
     }
 
     if (msg.type === "thinking_round") {
       active.thinkingPre.textContent += `\n\n【思考 ${msg.round}】\n`;
-      // scrollToBottom();
       return;
     }
 
     if (msg.type === "thinking") {
       active.thinkingPre.textContent += msg.text ?? "";
-      // scrollToBottom();
+      return;
+    }
+
+    if (msg.type === "status") {
+      active.statusPre.textContent += msg.text ?? "";
       return;
     }
 
     if (msg.type === "evidence") {
       const items = msg.items ?? [];
+      active.evidenceList.innerHTML = "";
       for (const it of items) {
         renderEvidenceItem(it, active.evidenceList);
       }
-      // scrollToBottom();
       return;
     }
 
     if (msg.type === "answer") {
       if (!active.answerStarted) {
         active.answerStarted = true;
-        // auto collapse first two sections
         active.thinkingDetails.open = false;
+        active.statusDetails.open = false;
         active.evidenceDetails.open = false;
       }
-active.answerMd = (active.answerMd ?? "") + (msg.text ?? "");
-renderMarkdown(active.finalText, active.answerMd);
+      active.answerMd = (active.answerMd ?? "") + (msg.text ?? "");
+      renderMarkdown(active.finalText, active.answerMd);
       scrollToBottom();
       return;
     }
 
     if (msg.type === "error") {
       const trace = msg.trace ? `\n${msg.trace}` : "";
-          active.answerMd = (active.answerMd ?? "") + `
-
-\`\`\`
-[error] ${msg.message ?? "unknown"}${trace}
-\`\`\`
-`;
-          renderMarkdown(active.finalText, active.answerMd);
+      active.answerMd = (active.answerMd ?? "") + `\n\n\
+\`\`\`\n[error] ${msg.message ?? "unknown"}${trace}\n\`\`\`\n`;
+      renderMarkdown(active.finalText, active.answerMd);
       scrollToBottom();
       return;
     }
 
     if (msg.type === "done") {
-      // generate a new input block under this answer
       active = null;
       streamEl.appendChild(mkInputBlock());
       scrollToBottom();
@@ -358,20 +361,15 @@ function sendQuestion(text, inputBlock) {
     return;
   }
 
-  // convert input block -> question block
   const qBlock = mkQuestionBlock(text);
+  const a = mkAnswerBlock();
+
   streamEl.replaceChild(qBlock, inputBlock);
+  streamEl.appendChild(a.block);
+  active = a;
 
-  // create answer block
-  const ans = mkAnswerBlock();
-  streamEl.appendChild(ans.block);
-  active = { ...ans, answerStarted: false, answerMd: "" };
-
-  // send to server
   ws.send(JSON.stringify({ type: "question", text }));
-
   scrollToBottom();
 }
 
-// Initial input block
 streamEl.appendChild(mkInputBlock());

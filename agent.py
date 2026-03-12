@@ -4,11 +4,11 @@ agent.py
 
 Overall QA orchestration logic.
 
-Design (updated):
-- After receiving a question, the agent FIRST thinks.
-- Retrieval is downgraded to a TOOL that the agent may (or may not) use.
-- The agent itself decides when to search, and provides search keywords.
-- If evidence is insufficient, the agent may call search multiple times.
+Design:
+- After receiving a question, the agent first thinks about whether retrieval is needed.
+- Retrieval is a tool that the agent may (or may not) use.
+- The agent decides when to search, and provides search keywords.
+- Search in this branch is a direct Neo4j scan and does not rely on any index.
 
 This file contains no GPU imports and can be safely imported by server.py.
 """
@@ -26,7 +26,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 # =============================================================================
 
 DECIDE_SYSTEM = """你是一个答题智能体（agent）。
-你有一个工具：graph_search，用于从Neo4j知识图谱中检索证据。
+你有一个工具：graph_search，用于在 Neo4j 图中按关键词直接检索证据（不依赖索引）。
 
 当前步骤：你只能“决定是否要调用工具”，不要回答用户问题本身。
 你必须只输出一段 JSON（不要加任何其它文字/解释/Markdown），格式二选一：
@@ -34,7 +34,7 @@ DECIDE_SYSTEM = """你是一个答题智能体（agent）。
 2) {"action":"final"}
 
 要求：
-- keywords 应该是简短的实体名/关键短语/术语（1-6个），用于图谱检索。
+- keywords 应该是简短的实体名/关键短语/术语（1-6个），用于图中检索。
 - 如果现有证据不足以严谨回答，就选 action=search，并给出新的 keywords。
 """
 
@@ -116,16 +116,16 @@ def brief_evidence(evidence_items: List[Dict[str, Any]], max_items: int = 8) -> 
     if not evidence_items:
         return "(空)"
     lines: List[str] = []
-    for it in evidence_items[:max_items]:
-        cid = it.get("cid", "")
-        node = it.get("node") or {}
+    for item in evidence_items[:max_items]:
+        cid = item.get("cid", "")
+        node = item.get("node") or {}
         name = (node.get("name") or "").strip()
         labels = node.get("labels") or []
-        labels_s = ",".join([str(x) for x in labels]) if labels else ""
+        labels_text = ",".join([str(x) for x in labels]) if labels else ""
         if name:
-            lines.append(f"- {cid}: {name} ({labels_s})")
+            lines.append(f"- {cid}: {name} ({labels_text})")
         else:
-            lines.append(f"- {cid}: ({labels_s})")
+            lines.append(f"- {cid}: ({labels_text})")
     if len(evidence_items) > max_items:
         lines.append(f"... (+{len(evidence_items) - max_items} more)")
     return "\n".join(lines)
@@ -136,24 +136,18 @@ def _renumber_context_and_items(
     new_items: List[Dict[str, Any]],
     new_context: str,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """Append new evidence to existing with stable unique C-ids.
-
-    - existing: C1..CN
-    - new:       C1..CM   -> renumbered to C(N+1)..C(N+M)
-    """
+    """Append new evidence to existing with stable unique C-ids."""
     offset = len(existing_items)
     if offset <= 0:
         return new_items, new_context
 
-    # Renumber items
     renumbered: List[Dict[str, Any]] = []
-    for i, it in enumerate(new_items, start=1):
+    for i, item in enumerate(new_items, start=1):
         cid_new = f"C{offset + i}"
-        it2 = dict(it)
-        it2["cid"] = cid_new
-        renumbered.append(it2)
+        item2 = dict(item)
+        item2["cid"] = cid_new
+        renumbered.append(item2)
 
-    # Renumber context text: replace "Ck:" headings only (best-effort).
     ctx = new_context
     for i in range(1, len(new_items) + 1):
         old = f"C{i}:"
@@ -175,18 +169,16 @@ class GraphSearchTool:
     driver: Any
     top_k: int
     expand_k: int
-    fulltext_index_name: str
     database: Optional[str] = None
 
     def search(self, keywords: Any) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
-        from graphrag import retrieve_evidence  # local import (lightweight)
+        from graphrag import retrieve_evidence
 
         return retrieve_evidence(
             driver=self.driver,
             keywords=keywords,
             top_k=int(self.top_k),
             expand_k=int(self.expand_k),
-            fulltext_index_name=str(self.fulltext_index_name),
             database=self.database,
         )
 
@@ -203,10 +195,7 @@ def run_agent_sync(
     max_search_rounds: int = 3,
     print_debug: bool = False,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Synchronous agent loop (used by CLI).
-
-    llm_get_response(messages, think, print_type) -> raw_text
-    """
+    """Synchronous agent loop (used by CLI)."""
     q = (question or "").strip()
     if not q:
         return "Empty question", []
@@ -214,8 +203,7 @@ def run_agent_sync(
     all_items: List[Dict[str, Any]] = []
     all_context_parts: List[str] = []
 
-    # Decide/search loop
-    for r in range(1, max_search_rounds + 1):
+    for round_idx in range(1, max_search_rounds + 1):
         evidence_brief = brief_evidence(all_items)
         decide_prompt = DECIDE_TEMPLATE.format(question=q, evidence_brief=evidence_brief)
         decide_messages = [
@@ -224,9 +212,9 @@ def run_agent_sync(
         ]
 
         if print_debug:
-            print(f"\n[agent] decide round={r}")
+            print(f"\n[agent] decide round={round_idx}")
 
-        raw = llm_get_response(decide_messages, True, "stream")
+        raw = llm_get_response(decide_messages, False, "stream")
         directive_text = raw.split("</think>")[-1].strip()
         decision = parse_decision(directive_text)
 
@@ -247,21 +235,17 @@ def run_agent_sync(
 
         if not items or not ctx.strip():
             print("[tool] no evidence returned.\n")
-            # continue to next decide round, letting the model adjust keywords
             continue
 
-        # Merge and renumber
         merged_items, renumbered_ctx = _renumber_context_and_items(all_items, items, ctx)
         all_items = merged_items
         all_context_parts.append(renumbered_ctx)
 
-        # Print references like previous CLI behavior (full context chunk)
         print("[References]")
         print(renumbered_ctx)
         print("=" * 80)
 
-    # Final answer
-    context_text = "\n\n".join([p for p in all_context_parts if p.strip()]).strip()
+    context_text = "\n\n".join([part for part in all_context_parts if part.strip()]).strip()
     if not context_text:
         final = "资料不足，无法确定（未获得可用的检索上下文）。"
         print("\nA>")
@@ -284,17 +268,12 @@ def run_agent_sync(
 async def run_agent_async(
     *,
     question: str,
-    llm_call: Callable[[List[Dict[str, str]], bool, bool], Awaitable[str]],
+    llm_call: Callable[[List[Dict[str, str]], bool, bool, bool], Awaitable[str]],
     search_tool: GraphSearchTool,
     emit: Callable[[Dict[str, Any]], Awaitable[None]],
     max_search_rounds: int = 3,
 ) -> None:
-    """Async agent loop (used by WebSocket server).
-
-    llm_call(messages, forward_answer_events, forward_done_event) -> answer_text (concatenated)
-      - For *decision* steps: forward_answer_events=False, forward_done_event=False
-      - For *final* step:    forward_answer_events=True,  forward_done_event=True
-    """
+    """Async agent loop (used by WebSocket server)."""
     q = (question or "").strip()
     if not q:
         await emit({"type": "error", "message": "Empty question"})
@@ -304,9 +283,8 @@ async def run_agent_async(
     all_items: List[Dict[str, Any]] = []
     all_context_parts: List[str] = []
 
-    # Decide/search loop
-    for r in range(1, max_search_rounds + 1):
-        await emit({"type": "thinking", "phase": "agent", "text": f"思考：是否需要检索（round={r})...\n"})
+    for round_idx in range(1, max_search_rounds + 1):
+        await emit({"type": "status", "phase": "agent", "text": f"判断是否需要检索（round={round_idx})...\n"})
 
         evidence_brief = brief_evidence(all_items)
         decide_prompt = DECIDE_TEMPLATE.format(question=q, evidence_brief=evidence_brief)
@@ -316,60 +294,56 @@ async def run_agent_async(
         ]
 
         try:
-            decision_answer_text = await llm_call(decide_messages, False, False)
-        except Exception as e:
-            await emit({"type": "error", "message": f"LLM failed: {e}"})
+            decision_answer_text = await llm_call(decide_messages, False, False, False)
+        except Exception as exc:
+            await emit({"type": "error", "message": f"LLM failed: {exc}"})
             await emit({"type": "done"})
             return
 
         decision = parse_decision((decision_answer_text or "").strip())
 
         if not decision:
-            await emit({"type": "thinking", "phase": "agent", "text": "解析决策失败，直接进入最终回答（可能无检索）。\n"})
+            await emit({"type": "status", "phase": "agent", "text": "解析决策失败，直接进入最终回答（可能无检索）。\n"})
             break
 
         if decision["action"] == "final":
-            await emit({"type": "thinking", "phase": "agent", "text": "决定：不再检索，直接作答。\n"})
+            await emit({"type": "status", "phase": "agent", "text": "决定：不再检索，直接作答。\n"})
             break
 
         keywords = decision["keywords"]
-        await emit({"type": "thinking", "phase": "tool", "text": f"启用检索 graph_search keywords={keywords}\n"})
+        await emit({"type": "status", "phase": "tool", "text": f"启用检索 graph_search keywords={keywords}\n"})
 
         try:
             items, ctx, meta = search_tool.search(keywords)
-        except Exception as e:
-            await emit({"type": "error", "message": f"Retrieve failed: {e}"})
+        except Exception as exc:
+            await emit({"type": "error", "message": f"Retrieve failed: {exc}"})
             await emit({"type": "done"})
             return
 
-        await emit({"type": "thinking", "phase": "tool", "text": f"检索完成：{meta}\n"})
+        await emit({"type": "status", "phase": "tool", "text": f"检索完成：{meta}\n"})
 
         if not items or not ctx.strip():
-            await emit({"type": "thinking", "phase": "tool", "text": "检索结果为空，尝试重新思考关键词...\n"})
+            await emit({"type": "status", "phase": "tool", "text": "检索结果为空，尝试重新思考关键词...\n"})
             continue
 
-        # Merge and renumber
         merged_items, renumbered_ctx = _renumber_context_and_items(all_items, items, ctx)
         all_items = merged_items
         all_context_parts.append(renumbered_ctx)
 
-        # Send cumulative evidence to UI (keeps UI logic simple)
         await emit({"type": "evidence", "items": all_items})
 
-    # Final answer
-    context_text = "\n\n".join([p for p in all_context_parts if p.strip()]).strip()
+    context_text = "\n\n".join([part for part in all_context_parts if part.strip()]).strip()
 
     if not context_text:
         await emit({"type": "answer", "text": "资料不足，无法确定（未获得可用的检索上下文）。"})
         await emit({"type": "done"})
         return
 
-    await emit({"type": "thinking", "phase": "llm", "text": "开始生成答案...\n"})
+    await emit({"type": "status", "phase": "llm", "text": "开始生成答案...\n"})
     messages = build_answer_messages(context=context_text, question=q)
 
-    # Stream final answer from GPU worker (server side)
     try:
-        await llm_call(messages, True, True)
-    except Exception as e:
-        await emit({"type": "error", "message": f"LLM failed: {e}"})
+        await llm_call(messages, True, True, True)
+    except Exception as exc:
+        await emit({"type": "error", "message": f"LLM failed: {exc}"})
         await emit({"type": "done"})

@@ -18,6 +18,7 @@ Request JSON schema (minimal):
 }
 
 Output JSONL events:
+- {"type":"status","phase":"worker_progress","text":"..."}
 - {"type":"thinking_round","round":1}
 - {"type":"thinking","round":1,"text":"..."}
 - {"type":"answer","text":"..."}
@@ -45,6 +46,10 @@ def emit(obj: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def emit_status(phase: str, text: str) -> None:
+    emit({"type": "status", "phase": phase, "text": text})
+
+
 def _get_req() -> Dict[str, Any]:
     raw = sys.stdin.read()
     raw = (raw or "").strip()
@@ -70,14 +75,119 @@ def _safe_messages(x: Any) -> List[Dict[str, str]]:
     return out
 
 
+def _stream_with_thinking(stream: Any) -> None:
+    state = "outside"
+    buf = ""
+    round_idx = 0
+
+    for chunk in stream:
+        if "choices" not in chunk or not chunk["choices"]:
+            continue
+        delta = chunk["choices"][0].get("delta", {})
+        if "content" not in delta:
+            continue
+
+        text = delta["content"]
+        if not text:
+            continue
+
+        buf += text
+
+        while True:
+            if state == "outside":
+                pos = buf.find(OPEN_TAG)
+                if pos != -1:
+                    if pos > 0:
+                        emit({"type": "answer", "text": buf[:pos]})
+                    buf = buf[pos + len(OPEN_TAG) :]
+                    round_idx += 1
+                    emit({"type": "thinking_round", "round": round_idx})
+                    state = "think"
+                    continue
+
+                safe_len = max(0, len(buf) - (MAX_TAG_LEN - 1))
+                if safe_len > 0:
+                    emit({"type": "answer", "text": buf[:safe_len]})
+                    buf = buf[safe_len:]
+                break
+
+            pos = buf.find(CLOSE_TAG)
+            if pos != -1:
+                if pos > 0:
+                    emit({"type": "thinking", "round": round_idx, "text": buf[:pos]})
+                buf = buf[pos + len(CLOSE_TAG) :]
+                state = "outside"
+                continue
+
+            safe_len = max(0, len(buf) - (MAX_TAG_LEN - 1))
+            if safe_len > 0:
+                emit({"type": "thinking", "round": round_idx, "text": buf[:safe_len]})
+                buf = buf[safe_len:]
+            break
+
+    if buf:
+        if state == "think":
+            emit({"type": "thinking", "round": round_idx, "text": buf})
+        else:
+            emit({"type": "answer", "text": buf})
+
+
+def _stream_without_thinking(stream: Any) -> None:
+    """Emit answer only, even if the model still leaks <think> blocks."""
+    state = "outside"
+    buf = ""
+
+    for chunk in stream:
+        if "choices" not in chunk or not chunk["choices"]:
+            continue
+        delta = chunk["choices"][0].get("delta", {})
+        if "content" not in delta:
+            continue
+
+        text = delta["content"]
+        if not text:
+            continue
+
+        buf += text
+
+        while True:
+            if state == "outside":
+                pos = buf.find(OPEN_TAG)
+                if pos != -1:
+                    if pos > 0:
+                        emit({"type": "answer", "text": buf[:pos]})
+                    buf = buf[pos + len(OPEN_TAG) :]
+                    state = "think"
+                    continue
+
+                safe_len = max(0, len(buf) - (MAX_TAG_LEN - 1))
+                if safe_len > 0:
+                    emit({"type": "answer", "text": buf[:safe_len]})
+                    buf = buf[safe_len:]
+                break
+
+            pos = buf.find(CLOSE_TAG)
+            if pos != -1:
+                buf = buf[pos + len(CLOSE_TAG) :]
+                state = "outside"
+                continue
+
+            safe_len = max(0, len(buf) - (MAX_TAG_LEN - 1))
+            if safe_len > 0:
+                buf = buf[safe_len:]
+            break
+
+    if buf and state == "outside":
+        emit({"type": "answer", "text": buf})
+
+
 def main() -> None:
-    # NOTE: To catch import-time errors (e.g., llama_cpp missing), we import heavy deps INSIDE main().
     try:
-        emit({"type": "thinking", "phase": "worker_progress", "text": "gpu_worker: init\n"})
+        emit_status("worker_progress", "gpu_worker: init\n")
 
         try:
-            import constants as C  # local project config
-            from llama_cpp import Llama  # heavy dep
+            import constants as C
+            from llama_cpp import Llama
         except Exception as e:
             emit({"type": "error", "message": f"gpu_worker import failed: {e}", "trace": traceback.format_exc(limit=50)})
             emit({"type": "done"})
@@ -87,7 +197,6 @@ def main() -> None:
         messages = _safe_messages(req.get("messages", []))
         think = bool(req.get("think", True))
 
-        # Generation params (allow override but default to constants)
         max_tokens = int(req.get("max_tokens", C.QWEN_MAX_TOKENS))
         temperature = float(req.get("temperature", C.QWEN_TEMPERATURE))
         top_k = int(req.get("top_k", C.QWEN_TOP_K))
@@ -95,11 +204,10 @@ def main() -> None:
         min_p = float(req.get("min_p", C.QWEN_MIN_P))
         presence_penalty = float(req.get("presence_penalty", C.QWEN_PRESENCE_PENALTY))
 
-        # IMPORTANT: only the worker touches GPU
         if getattr(C, "CUDA_VISIBLE_DEVICES", None) is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(C.CUDA_VISIBLE_DEVICES)
 
-        emit({"type": "thinking", "phase": "worker_progress", "text": "gpu_worker: loading model...\n"})
+        emit_status("worker_progress", f"gpu_worker: loading model... (think={think})\n")
 
         llm = Llama(
             C.GENERAL_MODEL_PATH,
@@ -108,9 +216,8 @@ def main() -> None:
             verbose=False,
         )
 
-        emit({"type": "thinking", "phase": "worker_progress", "text": "gpu_worker: model loaded, generating...\n"})
+        emit_status("worker_progress", "gpu_worker: model loaded, generating...\n")
 
-        # Qwen convention: append "/no_think" to disable thought blocks
         if not think:
             messages[-1]["content"] = (messages[-1].get("content", "") or "") + " /no_think"
 
@@ -125,68 +232,13 @@ def main() -> None:
             presence_penalty=presence_penalty,
         )
 
-        state = "outside"  # or "think"
-        buf = ""
-        round_idx = 0
-
-        for chunk in stream:
-            if "choices" not in chunk or not chunk["choices"]:
-                continue
-            delta = chunk["choices"][0].get("delta", {})
-            if "content" not in delta:
-                continue
-
-            text = delta["content"]
-            if not text:
-                continue
-
-            buf += text
-
-            while True:
-                if state == "outside":
-                    pos = buf.find(OPEN_TAG)
-                    if pos != -1:
-                        # Emit answer part before <think>
-                        if pos > 0:
-                            emit({"type": "answer", "text": buf[:pos]})
-                        buf = buf[pos + len(OPEN_TAG) :]
-                        round_idx += 1
-                        emit({"type": "thinking_round", "round": round_idx})
-                        state = "think"
-                        continue
-
-                    # No open tag: emit safe answer portion, keep tail for partial tag
-                    safe_len = max(0, len(buf) - (MAX_TAG_LEN - 1))
-                    if safe_len > 0:
-                        emit({"type": "answer", "text": buf[:safe_len]})
-                        buf = buf[safe_len:]
-                    break
-
-                else:
-                    pos = buf.find(CLOSE_TAG)
-                    if pos != -1:
-                        if pos > 0:
-                            emit({"type": "thinking", "round": round_idx, "text": buf[:pos]})
-                        buf = buf[pos + len(CLOSE_TAG) :]
-                        state = "outside"
-                        continue
-
-                    safe_len = max(0, len(buf) - (MAX_TAG_LEN - 1))
-                    if safe_len > 0:
-                        emit({"type": "thinking", "round": round_idx, "text": buf[:safe_len]})
-                        buf = buf[safe_len:]
-                    break
-
-        # Flush remaining buffer
-        if buf:
-            if state == "think":
-                emit({"type": "thinking", "round": round_idx, "text": buf})
-            else:
-                emit({"type": "answer", "text": buf})
+        if think:
+            _stream_with_thinking(stream)
+        else:
+            _stream_without_thinking(stream)
 
         emit({"type": "done"})
 
-        # Hard release
         try:
             del llm
         except Exception:

@@ -7,7 +7,7 @@
 """
 
 import os
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
 from llama_cpp import Llama
 import constants as C
@@ -41,11 +41,40 @@ class LLM_QWEN_Standalone:
         except Exception:
             pass
 
+    @staticmethod
+    def _strip_think_blocks(text: str) -> str:
+        if not text:
+            return ""
+
+        open_tag = "<think>"
+        close_tag = "</think>"
+        out: List[str] = []
+        i = 0
+        in_think = False
+
+        while i < len(text):
+            if not in_think:
+                j = text.find(open_tag, i)
+                if j == -1:
+                    out.append(text[i:])
+                    break
+                out.append(text[i:j])
+                i = j + len(open_tag)
+                in_think = True
+            else:
+                j = text.find(close_tag, i)
+                if j == -1:
+                    break
+                i = j + len(close_tag)
+                in_think = False
+
+        return "".join(out).strip()
+
     def get_response(self, messages: List[Dict], think: bool, print_type: str) -> str:
         """Return model output.
 
         Behavior:
-        - think=False: appends " /no_think" to the last message and returns final answer (strip before </think>)
+        - think=False: appends " /no_think" to the last message and suppresses thought blocks in returned text.
         - think=True:
             * print_type="stream": prints ONLY thought blocks (<think>...</think>) round-by-round,
               and returns the full raw text (thoughts + answer). The caller (main) should print separators
@@ -73,21 +102,20 @@ class LLM_QWEN_Standalone:
             presence_penalty=C.QWEN_PRESENCE_PENALTY,
         )
 
-        OPEN_TAG = "<think>"
-        CLOSE_TAG = "</think>"
-        MAX_TAG_LEN = max(len(OPEN_TAG), len(CLOSE_TAG))
+        open_tag = "<think>"
+        close_tag = "</think>"
+        max_tag_len = max(len(open_tag), len(close_tag))
 
         res = ""
 
         if print_type == "stream" and think:
-            # Print ONLY thoughts, in rounds
-            state = "outside"  # or "think"
+            state = "outside"
             buf = ""
             round_idx = 0
 
             def _trim_outside_buf():
                 nonlocal buf
-                safe_len = max(0, len(buf) - (MAX_TAG_LEN - 1))
+                safe_len = max(0, len(buf) - (max_tag_len - 1))
                 if safe_len > 0:
                     buf = buf[safe_len:]
 
@@ -103,35 +131,34 @@ class LLM_QWEN_Standalone:
 
                 while True:
                     if state == "outside":
-                        pos = buf.find(OPEN_TAG)
+                        pos = buf.find(open_tag)
                         if pos != -1:
-                            buf = buf[pos + len(OPEN_TAG):]  # discard outside prefix
+                            buf = buf[pos + len(open_tag):]
                             round_idx += 1
                             print(f"\n\n【思考 {round_idx}】\n", end="", flush=True)
                             state = "think"
                             continue
                         _trim_outside_buf()
                         break
-                    else:
-                        pos = buf.find(CLOSE_TAG)
-                        if pos != -1:
-                            if pos > 0:
-                                print(buf[:pos], end="", flush=True)
-                            buf = buf[pos + len(CLOSE_TAG):]
-                            print("\n", end="", flush=True)
-                            state = "outside"
-                            continue
 
-                        safe_len = max(0, len(buf) - (MAX_TAG_LEN - 1))
-                        if safe_len > 0:
-                            print(buf[:safe_len], end="", flush=True)
-                            buf = buf[safe_len:]
-                        break
+                    pos = buf.find(close_tag)
+                    if pos != -1:
+                        if pos > 0:
+                            print(buf[:pos], end="", flush=True)
+                        buf = buf[pos + len(close_tag):]
+                        print("\n", end="", flush=True)
+                        state = "outside"
+                        continue
 
-            print()  # newline after streaming thoughts
+                    safe_len = max(0, len(buf) - (max_tag_len - 1))
+                    if safe_len > 0:
+                        print(buf[:safe_len], end="", flush=True)
+                        buf = buf[safe_len:]
+                    break
+
+            print()
 
         else:
-            # Raw streaming/collecting
             for chunk in stream:
                 if "choices" in chunk and chunk["choices"]:
                     delta = chunk["choices"][0].get("delta", {})
@@ -144,7 +171,7 @@ class LLM_QWEN_Standalone:
                 print()
 
         if not think:
-            res = res.split(CLOSE_TAG)[-1].strip()
+            res = self._strip_think_blocks(res)
 
         if print_type == "result":
             print(res)
