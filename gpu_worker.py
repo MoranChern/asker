@@ -29,11 +29,12 @@ Output JSONL events:
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import os
 import sys
 import traceback
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 OPEN_TAG = "<think>"
@@ -73,6 +74,111 @@ def _safe_messages(x: Any) -> List[Dict[str, str]]:
     if not out:
         raise ValueError("messages cannot be empty")
     return out
+
+
+def _configure_cuda_visible_devices(constants_mod: Any) -> List[str]:
+    raw = getattr(constants_mod, "CUDA_VISIBLE_DEVICES", None)
+    if raw is None:
+        return []
+    value = str(raw).strip()
+    if not value:
+        return []
+    os.environ["CUDA_VISIBLE_DEVICES"] = value
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _auto_tensor_split(device_count: int) -> Optional[List[float]]:
+    if device_count <= 1:
+        return None
+    main_gpu_share = max(0.7, 1.0 - 0.1 * (device_count - 1))
+    return [main_gpu_share] + [1.0] * (device_count - 1)
+
+
+def _parse_tensor_split(raw: Any, device_count: int) -> Optional[List[float]]:
+    if device_count <= 1:
+        return None
+
+    if raw is None:
+        return _auto_tensor_split(device_count)
+
+    values: List[float]
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return _auto_tensor_split(device_count)
+        values = [float(x.strip()) for x in raw.split(",") if x.strip()]
+    elif isinstance(raw, (list, tuple)):
+        values = [float(x) for x in raw]
+    else:
+        raise ValueError("CUDA_TENSOR_SPLIT must be a comma-separated string or a list/tuple of numbers")
+
+    if len(values) != device_count:
+        raise ValueError(
+            f"CUDA_TENSOR_SPLIT length mismatch: expected {device_count}, got {len(values)}"
+        )
+    if any(v <= 0 for v in values):
+        raise ValueError("CUDA_TENSOR_SPLIT values must be > 0")
+    return values
+
+
+def _resolve_split_mode(llama_cpp_mod: Any, raw: Any) -> Optional[int]:
+    mode = str(raw or "layer").strip().lower()
+    mapping = {
+        "none": getattr(llama_cpp_mod, "LLAMA_SPLIT_MODE_NONE", None),
+        "layer": getattr(llama_cpp_mod, "LLAMA_SPLIT_MODE_LAYER", None),
+        "row": getattr(llama_cpp_mod, "LLAMA_SPLIT_MODE_ROW", None),
+    }
+    if mode not in mapping:
+        raise ValueError(f"Unsupported CUDA_SPLIT_MODE: {raw!r}")
+    return mapping[mode]
+
+
+def _build_llama_kwargs(constants_mod: Any, llama_cls: Any, llama_cpp_mod: Any, visible_devices: List[str]) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "model_path": constants_mod.GENERAL_MODEL_PATH,
+        "n_ctx": constants_mod.N_CTX,
+        "n_gpu_layers": constants_mod.N_GPU_LAYERS,
+        "verbose": False,
+    }
+
+    sig = inspect.signature(llama_cls.__init__)
+    supported = sig.parameters
+    device_count = len(visible_devices)
+
+    if "offload_kqv" in supported:
+        kwargs["offload_kqv"] = bool(getattr(constants_mod, "QWEN_OFFLOAD_KQV", True))
+
+    if "flash_attn" in supported:
+        kwargs["flash_attn"] = bool(
+            getattr(constants_mod, "QWEN_FLASH_ATTN", device_count > 1 or int(constants_mod.N_CTX) >= 16384)
+        )
+
+    if "n_batch" in supported:
+        kwargs["n_batch"] = int(getattr(constants_mod, "QWEN_N_BATCH", 512))
+
+    if "n_ubatch" in supported:
+        default_ubatch = 256 if device_count > 1 else kwargs.get("n_batch", 512)
+        kwargs["n_ubatch"] = min(int(kwargs.get("n_batch", 512)), int(getattr(constants_mod, "QWEN_N_UBATCH", default_ubatch)))
+
+    if device_count > 1:
+        split_mode = _resolve_split_mode(
+            llama_cpp_mod,
+            getattr(constants_mod, "CUDA_SPLIT_MODE", "layer"),
+        )
+        tensor_split = _parse_tensor_split(
+            getattr(constants_mod, "CUDA_TENSOR_SPLIT", None),
+            device_count,
+        )
+        main_gpu = int(getattr(constants_mod, "CUDA_MAIN_GPU", 0))
+
+        if "split_mode" in supported and split_mode is not None:
+            kwargs["split_mode"] = split_mode
+        if "tensor_split" in supported and tensor_split is not None:
+            kwargs["tensor_split"] = tensor_split
+        if "main_gpu" in supported:
+            kwargs["main_gpu"] = main_gpu
+
+    return kwargs
 
 
 def _stream_with_thinking(stream: Any) -> None:
@@ -187,6 +293,8 @@ def main() -> None:
 
         try:
             import constants as C
+            visible_devices = _configure_cuda_visible_devices(C)
+            import llama_cpp
             from llama_cpp import Llama
         except Exception as e:
             emit({"type": "error", "message": f"gpu_worker import failed: {e}", "trace": traceback.format_exc(limit=50)})
@@ -204,17 +312,17 @@ def main() -> None:
         min_p = float(req.get("min_p", C.QWEN_MIN_P))
         presence_penalty = float(req.get("presence_penalty", C.QWEN_PRESENCE_PENALTY))
 
-        if getattr(C, "CUDA_VISIBLE_DEVICES", None) is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(C.CUDA_VISIBLE_DEVICES)
-
-        emit_status("worker_progress", f"gpu_worker: loading model... (think={think})\n")
-
-        llm = Llama(
-            C.GENERAL_MODEL_PATH,
-            n_ctx=C.N_CTX,
-            n_gpu_layers=C.N_GPU_LAYERS,
-            verbose=False,
+        llama_kwargs = _build_llama_kwargs(C, Llama, llama_cpp, visible_devices)
+        emit_status(
+            "worker_progress",
+            (
+                "gpu_worker: loading model... "
+                f"(think={think}, visible_gpus={visible_devices or ['default']}, "
+                f"llama_kwargs={json.dumps(llama_kwargs, ensure_ascii=False, default=str)})\n"
+            ),
         )
+
+        llm = Llama(**llama_kwargs)
 
         emit_status("worker_progress", "gpu_worker: model loaded, generating...\n")
 
