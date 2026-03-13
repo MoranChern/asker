@@ -6,20 +6,21 @@
 - `agent.py`：问答编排（先思考，再决定是否检索）
 - `server.py`：Web 后端（FastAPI + WebSocket）
 - `gpu_worker.py`：短生命周期 GPU 进程（llama.cpp/Qwen 推理 + JSONL 流式输出）
-- `local_client.py`：命令行客户端
+- `local_client.py`：命令行客户端（仅通过 Web 服务访问后端）
 - `static/`：前端页面（滚动流 + 三种块 + Cytoscape 图谱证据）
-
-## 2) CLI 运行
-
-```bash
-python local_client.py
-```
 
 ## 3) Web 运行
 
 ```bash
 python server.py
 # 浏览器打开 http://localhost:8000
+```
+
+## 2) CLI 运行
+
+```bash
+# 需要线运行Web服务
+python local_client.py
 ```
 
 ## 4) 说明

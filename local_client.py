@@ -5,7 +5,9 @@ local_client.py
 A standalone terminal client for the GraphRAG web backend.
 
 Notes:
+- It only talks to the backend over HTTP/WebSocket.
 - It only depends on Python standard library plus project-local `constants`.
+- It must not import any other project module.
 - When no arguments are provided, it enters multi-turn interactive chat mode.
 - By default it reads server address from constants.SERVER_BIND_HOST / SERVER_BIND_PORT.
 - If the default bind host is 0.0.0.0, it will use localhost for client connection.
