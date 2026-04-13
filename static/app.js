@@ -307,6 +307,22 @@ async function requestJson(url, options = {}) {
   return data;
 }
 
+function formatBeijingTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
 function updateConversationHeader() {
   const current = state.conversations.find((item) => item.id === state.currentConversationId);
   if (!current) {
@@ -316,7 +332,7 @@ function updateConversationHeader() {
   }
   conversationTitleEl.textContent = current.title || "未命名会话";
   const count = Number(current.message_count ?? 0);
-  conversationMetaEl.textContent = `ID: ${current.id} · 消息数: ${count} · 更新时间: ${current.updated_at || "-"}`;
+  conversationMetaEl.textContent = `ID: ${current.id} · 消息数: ${count} · 更新时间: ${formatBeijingTime(current.updated_at)}（北京时间）`;
 }
 
 function renderConversationList() {
@@ -335,7 +351,7 @@ function renderConversationList() {
 
     const meta = document.createElement("div");
     meta.className = "conversation-item-meta";
-    meta.textContent = `messages=${item.message_count ?? 0}`;
+    meta.textContent = `${item.message_count ?? 0}条消息`;
     btn.appendChild(meta);
 
     btn.addEventListener("click", () => {

@@ -2,3 +2,5 @@ __pycache__
 neo_data/
 neo_data*
 neo4j/
+
+chat_history*
