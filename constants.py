@@ -46,6 +46,14 @@ QWEN_MIN_P = 0.0
 QWEN_PRESENCE_PENALTY = 1.5
 
 # -------------------------
+# Local chat history storage
+# -------------------------
+# Directory used to store local chat/session context on disk.
+# It can be a relative path (relative to server.py) or an absolute path.
+CHAT_STORAGE_DIR = "local_context"
+CHAT_DB_FILENAME = "chat_history.sqlite3"
+
+# -------------------------
 # Web server (FastAPI/Uvicorn) config
 # -------------------------
 # IMPORTANT: Per requirement, server.py MUST NOT read configuration from environment variables.

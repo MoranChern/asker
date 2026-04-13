@@ -97,15 +97,23 @@ def json_safe(obj: Any) -> Any:
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-CHAT_DB_PATH = BASE_DIR / "chat_history.sqlite3"
-HISTORY_MESSAGE_LIMIT = 12
+CHAT_STORAGE_DIR = Path(str(getattr(C, "CHAT_STORAGE_DIR", "local_context") or "local_context"))
+if not CHAT_STORAGE_DIR.is_absolute():
+    CHAT_STORAGE_DIR = BASE_DIR / CHAT_STORAGE_DIR
+CHAT_DB_PATH = CHAT_STORAGE_DIR / str(getattr(C, "CHAT_DB_FILENAME", "chat_history.sqlite3") or "chat_history.sqlite3")
+HISTORY_MESSAGE_LIMIT = int(getattr(C, "HISTORY_MESSAGE_LIMIT", 12))
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def ensure_chat_storage_dir() -> None:
+    CHAT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def db_connect() -> sqlite3.Connection:
+    ensure_chat_storage_dir()
     conn = sqlite3.connect(str(CHAT_DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -383,6 +391,7 @@ def health() -> JSONResponse:
             "ok": ok,
             "neo4j_uri": NEO4J_URI,
             "neo4j_db": NEO4J_DATABASE,
+            "chat_storage_dir": str(CHAT_STORAGE_DIR),
             "chat_db": str(CHAT_DB_PATH),
             "conversation_count": len(list_conversations_db()),
         }
