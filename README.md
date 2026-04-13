@@ -9,14 +9,14 @@
 - `local_client.py`：命令行客户端（仅通过 Web 服务访问后端）
 - `static/`：前端页面（滚动流 + 三种块 + Cytoscape 图谱证据）
 
-## 3) Web 运行
+## 2) Web 运行
 
 ```bash
 python server.py
 # 浏览器打开 http://localhost:8000
 ```
 
-## 2) CLI 运行
+## 3) CLI 运行
 
 ```bash
 # 需要线运行Web服务
