@@ -18,23 +18,27 @@ Current behavior:
 - Answering is orchestrated by agent.py.
 - Retrieval is a tool; the agent decides if/when to use it.
 - Retrieval in this branch is direct Neo4j scanning and does not use any index.
+- Conversation and message history are persisted in SQLite.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
 import traceback
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import neo4j
-from neo4j import GraphDatabase  # type: ignore
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from neo4j import GraphDatabase  # type: ignore
 
 import constants as C
 from agent import GraphSearchTool, run_agent_async
@@ -88,16 +92,264 @@ def json_safe(obj: Any) -> Any:
 
 
 # -----------------------------------------------------------------------------
-# FastAPI app
+# Paths / SQLite
 # -----------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+CHAT_DB_PATH = BASE_DIR / "chat_history.sqlite3"
+HISTORY_MESSAGE_LIMIT = 12
 
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(CHAT_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _conversation_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "title": str(row["title"]),
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+        "message_count": int(row["message_count"] or 0),
+    }
+
+
+def _message_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "conversation_id": str(row["conversation_id"]),
+        "role": str(row["role"]),
+        "content": str(row["content"]),
+        "created_at": str(row["created_at"]),
+    }
+
+
+def init_chat_db() -> None:
+    with db_connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant')),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_id ON messages(conversation_id, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations(updated_at DESC, created_at DESC)"
+        )
+
+        count = int(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
+        if count == 0:
+            _create_conversation_locked(conn, None)
+
+        conn.commit()
+
+
+def _default_conversation_title_locked(conn: sqlite3.Connection) -> str:
+    count = int(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
+    return f"新会话 {count + 1}"
+
+
+def _create_conversation_locked(conn: sqlite3.Connection, title: Optional[str]) -> Dict[str, Any]:
+    now = utc_now_iso()
+    conv_id = uuid.uuid4().hex
+    conv_title = (title or "").strip() or _default_conversation_title_locked(conn)
+    conn.execute(
+        "INSERT INTO conversations(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        (conv_id, conv_title, now, now),
+    )
+    row = conn.execute(
+        """
+        SELECT c.id, c.title, c.created_at, c.updated_at,
+               COALESCE(COUNT(m.id), 0) AS message_count
+        FROM conversations c
+        LEFT JOIN messages m ON m.conversation_id = c.id
+        WHERE c.id = ?
+        GROUP BY c.id, c.title, c.created_at, c.updated_at
+        """,
+        (conv_id,),
+    ).fetchone()
+    assert row is not None
+    return _conversation_row_to_dict(row)
+
+
+def list_conversations_db() -> List[Dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.id, c.title, c.created_at, c.updated_at,
+                   COALESCE(COUNT(m.id), 0) AS message_count
+            FROM conversations c
+            LEFT JOIN messages m ON m.conversation_id = c.id
+            GROUP BY c.id, c.title, c.created_at, c.updated_at
+            ORDER BY c.updated_at DESC, c.created_at DESC, c.id DESC
+            """
+        ).fetchall()
+    return [_conversation_row_to_dict(row) for row in rows]
+
+
+def get_conversation_db(conversation_id: str) -> Optional[Dict[str, Any]]:
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT c.id, c.title, c.created_at, c.updated_at,
+                   COALESCE(COUNT(m.id), 0) AS message_count
+            FROM conversations c
+            LEFT JOIN messages m ON m.conversation_id = c.id
+            WHERE c.id = ?
+            GROUP BY c.id, c.title, c.created_at, c.updated_at
+            """,
+            (conversation_id,),
+        ).fetchone()
+    return _conversation_row_to_dict(row) if row is not None else None
+
+
+def create_conversation_db(title: Optional[str]) -> Dict[str, Any]:
+    with db_connect() as conn:
+        data = _create_conversation_locked(conn, title)
+        conn.commit()
+    return data
+
+
+def rename_conversation_db(conversation_id: str, title: str) -> Dict[str, Any]:
+    new_title = (title or "").strip()
+    if not new_title:
+        raise HTTPException(status_code=400, detail="title must not be empty")
+
+    with db_connect() as conn:
+        exists = conn.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+
+        now = utc_now_iso()
+        conn.execute(
+            "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+            (new_title, now, conversation_id),
+        )
+        conn.commit()
+
+    data = get_conversation_db(conversation_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return data
+
+
+def delete_conversation_db(conversation_id: str) -> None:
+    with db_connect() as conn:
+        row = conn.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        conn.commit()
+
+
+def get_messages_db(conversation_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    if get_conversation_db(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+    with db_connect() as conn:
+        if limit is None:
+            rows = conn.execute(
+                """
+                SELECT id, conversation_id, role, content, created_at
+                FROM messages
+                WHERE conversation_id = ?
+                ORDER BY id ASC
+                """,
+                (conversation_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, conversation_id, role, content, created_at
+                FROM (
+                    SELECT id, conversation_id, role, content, created_at
+                    FROM messages
+                    WHERE conversation_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (conversation_id, int(limit)),
+            ).fetchall()
+    return [_message_row_to_dict(row) for row in rows]
+
+
+def save_message_db(conversation_id: str, role: str, content: str) -> Dict[str, Any]:
+    msg_role = str(role or "").strip().lower()
+    if msg_role not in ("system", "user", "assistant"):
+        raise ValueError(f"invalid role: {role}")
+    if get_conversation_db(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+    now = utc_now_iso()
+    with db_connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO messages(conversation_id, role, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (conversation_id, msg_role, content, now),
+        )
+        conn.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (now, conversation_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT id, conversation_id, role, content, created_at
+            FROM messages
+            WHERE id = ?
+            """,
+            (int(cur.lastrowid),),
+        ).fetchone()
+    assert row is not None
+    return _message_row_to_dict(row)
+
+
+def get_or_create_latest_conversation() -> Dict[str, Any]:
+    items = list_conversations_db()
+    if items:
+        return items[0]
+    return create_conversation_db(None)
+
+
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _DRIVER
+    init_chat_db()
     _DRIVER = create_driver()
     try:
         await asyncio.to_thread(_DRIVER.verify_connectivity)
@@ -112,7 +364,7 @@ async def lifespan(app: FastAPI):
         _DRIVER = None
 
 
-app = FastAPI(title="GraphRAG WebApp", version="0.2", lifespan=lifespan)
+app = FastAPI(title="GraphRAG WebApp", version="0.3", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 _GPU_SEM = asyncio.Semaphore(int(C.SERVER_GPU_WORKERS))
@@ -126,7 +378,52 @@ def index() -> FileResponse:
 @app.get("/api/health")
 def health() -> JSONResponse:
     ok = _DRIVER is not None
-    return JSONResponse({"ok": ok, "neo4j_uri": NEO4J_URI, "neo4j_db": NEO4J_DATABASE})
+    return JSONResponse(
+        {
+            "ok": ok,
+            "neo4j_uri": NEO4J_URI,
+            "neo4j_db": NEO4J_DATABASE,
+            "chat_db": str(CHAT_DB_PATH),
+            "conversation_count": len(list_conversations_db()),
+        }
+    )
+
+
+@app.get("/api/conversations")
+def list_conversations_api() -> JSONResponse:
+    return JSONResponse({"items": list_conversations_db()})
+
+
+@app.post("/api/conversations")
+def create_conversation_api(payload: Optional[Dict[str, Any]] = Body(default=None)) -> JSONResponse:
+    title = None
+    if isinstance(payload, dict):
+        title = payload.get("title")
+    item = create_conversation_db(None if title is None else str(title))
+    return JSONResponse(item)
+
+
+@app.get("/api/conversations/{conversation_id}/messages")
+def get_conversation_messages_api(conversation_id: str) -> JSONResponse:
+    return JSONResponse({"items": get_messages_db(conversation_id)})
+
+
+@app.patch("/api/conversations/{conversation_id}")
+def rename_conversation_api(
+    conversation_id: str,
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+) -> JSONResponse:
+    title = ""
+    if isinstance(payload, dict):
+        title = str(payload.get("title", ""))
+    item = rename_conversation_db(conversation_id, title)
+    return JSONResponse(item)
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def delete_conversation_api(conversation_id: str) -> JSONResponse:
+    delete_conversation_db(conversation_id)
+    return JSONResponse({"ok": True, "deleted_id": conversation_id})
 
 
 @app.get("/api/node/{eid}")
@@ -395,6 +692,28 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 await emit({"type": "done"})
                 continue
 
+            conv_id = str(msg.get("conversation_id", "")).strip()
+            if conv_id:
+                conv = get_conversation_db(conv_id)
+                if conv is None:
+                    await emit({"type": "error", "message": f"conversation not found: {conv_id}"})
+                    await emit({"type": "done"})
+                    continue
+            else:
+                conv = get_or_create_latest_conversation()
+                conv_id = str(conv["id"])
+
+            await emit({
+                "type": "conversation_meta",
+                "conversation_id": conv_id,
+                "conversation_title": conv.get("title", ""),
+            })
+
+            history_messages = [
+                {"role": item["role"], "content": item["content"]}
+                for item in get_messages_db(conv_id, limit=HISTORY_MESSAGE_LIMIT)
+            ]
+
             tool = GraphSearchTool(
                 driver=_DRIVER,
                 top_k=TOP_K,
@@ -417,13 +736,17 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 )
 
             try:
-                await run_agent_async(
+                answer_text = await run_agent_async(
                     question=question,
                     llm_call=llm_call,
                     search_tool=tool,
                     emit=emit,
                     max_search_rounds=3,
+                    chat_history=history_messages,
                 )
+                if answer_text:
+                    save_message_db(conv_id, "user", question)
+                    save_message_db(conv_id, "assistant", answer_text)
             except WebSocketDisconnect:
                 raise
             except Exception as exc:

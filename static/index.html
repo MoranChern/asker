@@ -5,14 +5,46 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>GraphRAG WebApp</title>
   <link rel="stylesheet" href="/static/style.css" />
-  <!-- Markdown rendering -->
   <script src="https://unpkg.com/marked@12.0.2/marked.min.js"></script>
   <script src="https://unpkg.com/dompurify@3.1.5/dist/purify.min.js"></script>
-  <!-- Cytoscape for graph visualization -->
   <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
 </head>
 <body>
-  <div id="stream"></div>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div>
+          <div class="sidebar-title">会话</div>
+          <div class="sidebar-subtitle">SQLite 持久化</div>
+        </div>
+        <button id="newConversationBtn" class="primary-btn">+ 新建</button>
+      </div>
+      <div id="conversationList" class="conversation-list"></div>
+    </aside>
+
+    <main class="main-panel">
+      <header class="chat-header">
+        <div>
+          <div id="conversationTitle" class="chat-title">未选择会话</div>
+          <div id="conversationMeta" class="chat-meta"></div>
+        </div>
+        <div class="chat-actions">
+          <button id="renameConversationBtn">重命名</button>
+          <button id="deleteConversationBtn" class="danger-btn">删除</button>
+        </div>
+      </header>
+
+      <div id="messages" class="messages"></div>
+
+      <div class="composer">
+        <textarea id="questionInput" placeholder="输入问题，Ctrl+Enter 发送"></textarea>
+        <div class="composer-actions">
+          <div class="composer-hint">Ctrl+Enter 发送</div>
+          <button id="sendBtn" class="primary-btn">发送</button>
+        </div>
+      </div>
+    </main>
+  </div>
 
   <div id="detailPanel" class="detail hidden">
     <div class="detail-header">

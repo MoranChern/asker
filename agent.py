@@ -36,9 +36,13 @@ DECIDE_SYSTEM = """你是一个答题智能体（agent）。
 要求：
 - keywords 应该是简短的实体名/关键短语/术语（1-6个），用于图中检索。
 - 如果现有证据不足以严谨回答，就选 action=search，并给出新的 keywords。
+- 用户当前问题可能依赖前面对话，请结合 Conversation History 一起判断。
 """
 
-DECIDE_TEMPLATE = """用户问题：
+DECIDE_TEMPLATE = """Conversation History（可能为空）：
+{history_text}
+
+用户当前问题：
 {question}
 
 当前已获得的证据摘要（可能为空）：
@@ -52,6 +56,10 @@ ANSWER_TEMPLATE = r"""
 - 如果 Context 信息不足，请明确说“资料不足，无法确定”，并说明缺了什么。
 - 每当你引用 Context 中的事实，都要用 [C1] [C2] 这样的引用标注。
 - 不要编造任何 Context 中不存在的细节。
+- 用户当前问题可能依赖 Conversation History，请先正确理解历史对话，再基于 Context 作答。
+
+Conversation History:
+{history_text}
 
 Context:
 {context}
@@ -63,8 +71,39 @@ Answer:
 """.strip()
 
 
-def build_answer_messages(context: str, question: str) -> List[Dict[str, str]]:
-    prompt = ANSWER_TEMPLATE.format(context=context, query_text=question)
+def format_chat_history(chat_history: Optional[List[Dict[str, str]]], max_messages: int = 12, max_chars: int = 1200) -> str:
+    if not chat_history:
+        return "(空)"
+
+    lines: List[str] = []
+    for msg in chat_history[-max_messages:]:
+        role = str(msg.get("role", "")).strip().lower()
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+        if len(content) > max_chars:
+            content = content[:max_chars] + "..."
+        if role == "assistant":
+            who = "Assistant"
+        elif role == "system":
+            who = "System"
+        else:
+            who = "User"
+        lines.append(f"{who}: {content}")
+
+    return "\n".join(lines) if lines else "(空)"
+
+
+def build_answer_messages(
+    context: str,
+    question: str,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, str]]:
+    prompt = ANSWER_TEMPLATE.format(
+        context=context,
+        query_text=question,
+        history_text=format_chat_history(chat_history),
+    )
     return [
         {"role": "system", "content": ANSWER_SYSTEM},
         {"role": "user", "content": prompt},
@@ -194,6 +233,7 @@ def run_agent_sync(
     search_tool: GraphSearchTool,
     max_search_rounds: int = 3,
     print_debug: bool = False,
+    chat_history: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Synchronous agent loop (used by CLI)."""
     q = (question or "").strip()
@@ -202,10 +242,15 @@ def run_agent_sync(
 
     all_items: List[Dict[str, Any]] = []
     all_context_parts: List[str] = []
+    history_text = format_chat_history(chat_history)
 
     for round_idx in range(1, max_search_rounds + 1):
         evidence_brief = brief_evidence(all_items)
-        decide_prompt = DECIDE_TEMPLATE.format(question=q, evidence_brief=evidence_brief)
+        decide_prompt = DECIDE_TEMPLATE.format(
+            question=q,
+            evidence_brief=evidence_brief,
+            history_text=history_text,
+        )
         decide_messages = [
             {"role": "system", "content": DECIDE_SYSTEM},
             {"role": "user", "content": decide_prompt},
@@ -253,7 +298,7 @@ def run_agent_sync(
         print()
         return final, all_items
 
-    messages = build_answer_messages(context=context_text, question=q)
+    messages = build_answer_messages(context=context_text, question=q, chat_history=chat_history)
     raw = llm_get_response(messages, True, "stream")
     answer = raw.split("</think>")[-1].strip()
 
@@ -272,22 +317,28 @@ async def run_agent_async(
     search_tool: GraphSearchTool,
     emit: Callable[[Dict[str, Any]], Awaitable[None]],
     max_search_rounds: int = 3,
-) -> None:
+    chat_history: Optional[List[Dict[str, str]]] = None,
+) -> str:
     """Async agent loop (used by WebSocket server)."""
     q = (question or "").strip()
     if not q:
         await emit({"type": "error", "message": "Empty question"})
         await emit({"type": "done"})
-        return
+        return ""
 
     all_items: List[Dict[str, Any]] = []
     all_context_parts: List[str] = []
+    history_text = format_chat_history(chat_history)
 
     for round_idx in range(1, max_search_rounds + 1):
         await emit({"type": "status", "phase": "agent", "text": f"判断是否需要检索（round={round_idx})...\n"})
 
         evidence_brief = brief_evidence(all_items)
-        decide_prompt = DECIDE_TEMPLATE.format(question=q, evidence_brief=evidence_brief)
+        decide_prompt = DECIDE_TEMPLATE.format(
+            question=q,
+            evidence_brief=evidence_brief,
+            history_text=history_text,
+        )
         decide_messages = [
             {"role": "system", "content": DECIDE_SYSTEM},
             {"role": "user", "content": decide_prompt},
@@ -298,7 +349,7 @@ async def run_agent_async(
         except Exception as exc:
             await emit({"type": "error", "message": f"LLM failed: {exc}"})
             await emit({"type": "done"})
-            return
+            return ""
 
         decision = parse_decision((decision_answer_text or "").strip())
 
@@ -318,7 +369,7 @@ async def run_agent_async(
         except Exception as exc:
             await emit({"type": "error", "message": f"Retrieve failed: {exc}"})
             await emit({"type": "done"})
-            return
+            return ""
 
         await emit({"type": "status", "phase": "tool", "text": f"检索完成：{meta}\n"})
 
@@ -335,15 +386,19 @@ async def run_agent_async(
     context_text = "\n\n".join([part for part in all_context_parts if part.strip()]).strip()
 
     if not context_text:
-        await emit({"type": "answer", "text": "资料不足，无法确定（未获得可用的检索上下文）。"})
+        final_text = "资料不足，无法确定（未获得可用的检索上下文）。"
+        await emit({"type": "answer", "text": final_text})
         await emit({"type": "done"})
-        return
+        return final_text
 
     await emit({"type": "status", "phase": "llm", "text": "开始生成答案...\n"})
-    messages = build_answer_messages(context=context_text, question=q)
+    messages = build_answer_messages(context=context_text, question=q, chat_history=chat_history)
 
     try:
-        await llm_call(messages, True, True, True)
+        answer_text = await llm_call(messages, True, True, True)
     except Exception as exc:
         await emit({"type": "error", "message": f"LLM failed: {exc}"})
         await emit({"type": "done"})
+        return ""
+
+    return answer_text.split("</think>")[-1].strip()

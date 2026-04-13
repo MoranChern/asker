@@ -1,4 +1,13 @@
-const streamEl = document.getElementById("stream");
+const conversationListEl = document.getElementById("conversationList");
+const conversationTitleEl = document.getElementById("conversationTitle");
+const conversationMetaEl = document.getElementById("conversationMeta");
+const newConversationBtn = document.getElementById("newConversationBtn");
+const renameConversationBtn = document.getElementById("renameConversationBtn");
+const deleteConversationBtn = document.getElementById("deleteConversationBtn");
+const messagesEl = document.getElementById("messages");
+const questionInput = document.getElementById("questionInput");
+const sendBtn = document.getElementById("sendBtn");
+
 const detailPanel = document.getElementById("detailPanel");
 const detailTitle = document.getElementById("detailTitle");
 const detailContent = document.getElementById("detailContent");
@@ -14,8 +23,8 @@ function showDetail(title, obj) {
   detailPanel.classList.remove("hidden");
 }
 
-function scrollToBottom() {
-  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+function scrollMessagesToBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 function renderMarkdown(el, mdText) {
@@ -48,7 +57,6 @@ function enableAutoResizeTextarea(ta) {
     composing = false;
     requestAnimationFrame(resize);
   });
-
   ta.addEventListener("input", () => {
     if (composing) return;
     requestAnimationFrame(resize);
@@ -57,33 +65,12 @@ function enableAutoResizeTextarea(ta) {
   requestAnimationFrame(resize);
 }
 
+enableAutoResizeTextarea(questionInput);
+
 function mkBlock(type) {
   const div = document.createElement("div");
   div.className = `block ${type}`;
   return div;
-}
-
-function mkInputBlock() {
-  const b = mkBlock("input");
-
-  const ta = document.createElement("textarea");
-  ta.placeholder = "输入问题，Ctrl+Enter 发送";
-  b.appendChild(ta);
-
-  enableAutoResizeTextarea(ta);
-
-  ta.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && e.ctrlKey) {
-      e.preventDefault();
-      const text = ta.value.trim();
-      if (!text) return;
-      sendQuestion(text, b);
-    }
-  });
-
-  setTimeout(() => ta.focus(), 50);
-
-  return b;
 }
 
 function mkQuestionBlock(text) {
@@ -96,6 +83,20 @@ function mkQuestionBlock(text) {
   const body = document.createElement("div");
   body.textContent = text;
   b.appendChild(body);
+  return b;
+}
+
+function mkHistoryAnswerBlock(text) {
+  const b = mkBlock("answer");
+  const title = document.createElement("div");
+  title.className = "title";
+  title.textContent = "Answer";
+  b.appendChild(title);
+
+  const finalText = document.createElement("div");
+  finalText.className = "final-text";
+  renderMarkdown(finalText, text ?? "");
+  b.appendChild(finalText);
   return b;
 }
 
@@ -116,7 +117,6 @@ function mkAnswerBlock() {
   thinkingDetails.appendChild(thinkingSummary);
 
   const thinkingPre = document.createElement("pre");
-  thinkingPre.dataset.role = "thinking";
   thinkingDetails.appendChild(thinkingPre);
 
   const statusDetails = document.createElement("details");
@@ -128,7 +128,6 @@ function mkAnswerBlock() {
   statusDetails.appendChild(statusSummary);
 
   const statusPre = document.createElement("pre");
-  statusPre.dataset.role = "status";
   statusDetails.appendChild(statusPre);
 
   const evidenceDetails = document.createElement("details");
@@ -147,13 +146,12 @@ function mkAnswerBlock() {
   finalSection.className = "section";
 
   const finalTitle = document.createElement("div");
-  finalTitle.style.fontWeight = "700";
+  finalTitle.className = "final-title";
   finalTitle.textContent = "Final Answer";
   finalSection.appendChild(finalTitle);
 
   const finalText = document.createElement("div");
   finalText.className = "final-text";
-  finalText.dataset.role = "answer";
   finalSection.appendChild(finalText);
 
   b.appendChild(thinkingDetails);
@@ -170,6 +168,8 @@ function mkAnswerBlock() {
     evidenceDetails,
     evidenceList,
     finalText,
+    answerStarted: false,
+    answerMd: "",
   };
 }
 
@@ -272,25 +272,187 @@ function renderEvidenceItem(item, evidenceList) {
   });
 }
 
-let ws = null;
-let wsReady = false;
-let active = null;
+const state = {
+  ws: null,
+  wsReady: false,
+  conversations: [],
+  currentConversationId: "",
+  active: null,
+};
+
+function ensureNoActiveConversationAction() {
+  if (state.active) {
+    alert("当前会话正在生成回答，请等待完成后再切换或编辑会话。");
+    return false;
+  }
+  return true;
+}
+
+async function requestJson(url, options = {}) {
+  const res = await fetch(url, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!res.ok) {
+    const message = data?.detail || data?.message || text || `${res.status} ${res.statusText}`;
+    throw new Error(String(message));
+  }
+  return data;
+}
+
+function updateConversationHeader() {
+  const current = state.conversations.find((item) => item.id === state.currentConversationId);
+  if (!current) {
+    conversationTitleEl.textContent = "未选择会话";
+    conversationMetaEl.textContent = "";
+    return;
+  }
+  conversationTitleEl.textContent = current.title || "未命名会话";
+  const count = Number(current.message_count ?? 0);
+  conversationMetaEl.textContent = `ID: ${current.id} · 消息数: ${count} · 更新时间: ${current.updated_at || "-"}`;
+}
+
+function renderConversationList() {
+  conversationListEl.innerHTML = "";
+  for (const item of state.conversations) {
+    const btn = document.createElement("button");
+    btn.className = "conversation-item";
+    if (item.id === state.currentConversationId) {
+      btn.classList.add("active");
+    }
+
+    const title = document.createElement("div");
+    title.className = "conversation-item-title";
+    title.textContent = item.title || "未命名会话";
+    btn.appendChild(title);
+
+    const meta = document.createElement("div");
+    meta.className = "conversation-item-meta";
+    meta.textContent = `messages=${item.message_count ?? 0}`;
+    btn.appendChild(meta);
+
+    btn.addEventListener("click", () => {
+      selectConversation(item.id);
+    });
+
+    conversationListEl.appendChild(btn);
+  }
+  updateConversationHeader();
+}
+
+async function refreshConversations({ autoSelect = true } = {}) {
+  const data = await requestJson("/api/conversations");
+  state.conversations = Array.isArray(data?.items) ? data.items : [];
+
+  if (!state.conversations.length) {
+    const created = await requestJson("/api/conversations", { method: "POST", body: JSON.stringify({}) });
+    state.conversations = [created];
+  }
+
+  if (autoSelect) {
+    const exists = state.conversations.some((item) => item.id === state.currentConversationId);
+    if (!exists) {
+      state.currentConversationId = state.conversations[0]?.id || "";
+    }
+  }
+
+  renderConversationList();
+}
+
+async function loadMessages(conversationId) {
+  messagesEl.innerHTML = "";
+  if (!conversationId) {
+    updateConversationHeader();
+    return;
+  }
+  const data = await requestJson(`/api/conversations/${encodeURIComponent(conversationId)}/messages`);
+  const items = Array.isArray(data?.items) ? data.items : [];
+  for (const item of items) {
+    if (item.role === "user") {
+      messagesEl.appendChild(mkQuestionBlock(item.content ?? ""));
+    } else if (item.role === "assistant") {
+      messagesEl.appendChild(mkHistoryAnswerBlock(item.content ?? ""));
+    }
+  }
+  updateConversationHeader();
+  scrollMessagesToBottom();
+}
+
+async function selectConversation(conversationId) {
+  if (!ensureNoActiveConversationAction()) return;
+  state.currentConversationId = conversationId;
+  renderConversationList();
+  await loadMessages(conversationId);
+}
+
+async function createConversation() {
+  if (!ensureNoActiveConversationAction()) return;
+  const title = window.prompt("请输入新会话名称（可留空）", "") ?? "";
+  const created = await requestJson("/api/conversations", {
+    method: "POST",
+    body: JSON.stringify(title.trim() ? { title: title.trim() } : {}),
+  });
+  await refreshConversations({ autoSelect: false });
+  state.currentConversationId = created.id;
+  renderConversationList();
+  await loadMessages(created.id);
+}
+
+async function renameConversation() {
+  if (!ensureNoActiveConversationAction()) return;
+  const current = state.conversations.find((item) => item.id === state.currentConversationId);
+  if (!current) {
+    alert("请先选择会话。");
+    return;
+  }
+  const title = window.prompt("请输入新的会话名称", current.title || "") ?? "";
+  if (!title.trim()) return;
+  await requestJson(`/api/conversations/${encodeURIComponent(current.id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ title: title.trim() }),
+  });
+  await refreshConversations({ autoSelect: false });
+  renderConversationList();
+  updateConversationHeader();
+}
+
+async function deleteConversation() {
+  if (!ensureNoActiveConversationAction()) return;
+  const current = state.conversations.find((item) => item.id === state.currentConversationId);
+  if (!current) {
+    alert("请先选择会话。");
+    return;
+  }
+  const ok = window.confirm(`确认删除会话“${current.title || current.id}”？`);
+  if (!ok) return;
+  await requestJson(`/api/conversations/${encodeURIComponent(current.id)}`, { method: "DELETE" });
+  state.currentConversationId = "";
+  await refreshConversations({ autoSelect: true });
+  await loadMessages(state.currentConversationId);
+}
 
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  state.ws = new WebSocket(`${proto}://${location.host}/ws`);
 
-  ws.onopen = () => {
-    wsReady = true;
+  state.ws.onopen = () => {
+    state.wsReady = true;
   };
 
-  ws.onclose = () => {
-    wsReady = false;
+  state.ws.onclose = () => {
+    state.wsReady = false;
     setTimeout(connectWS, 1000);
   };
 
-  ws.onmessage = (ev) => {
-    if (!active) return;
+  state.ws.onmessage = (ev) => {
+    if (!state.active) return;
     let msg = null;
     try {
       msg = JSON.parse(ev.data);
@@ -298,78 +460,146 @@ function connectWS() {
       msg = { type: "status", text: ev.data };
     }
 
+    if (msg.type === "conversation_meta") {
+      if (msg.conversation_id) {
+        state.currentConversationId = msg.conversation_id;
+      }
+      return;
+    }
+
     if (msg.type === "thinking_round") {
-      active.thinkingPre.textContent += `\n\n【思考 ${msg.round}】\n`;
+      state.active.thinkingPre.textContent += `\n\n【思考 ${msg.round}】\n`;
       return;
     }
 
     if (msg.type === "thinking") {
-      active.thinkingPre.textContent += msg.text ?? "";
+      state.active.thinkingPre.textContent += msg.text ?? "";
       return;
     }
 
     if (msg.type === "status") {
-      active.statusPre.textContent += msg.text ?? "";
+      state.active.statusPre.textContent += msg.text ?? "";
       return;
     }
 
     if (msg.type === "evidence") {
       const items = msg.items ?? [];
-      active.evidenceList.innerHTML = "";
+      state.active.evidenceList.innerHTML = "";
       for (const it of items) {
-        renderEvidenceItem(it, active.evidenceList);
+        renderEvidenceItem(it, state.active.evidenceList);
       }
       return;
     }
 
     if (msg.type === "answer") {
-      if (!active.answerStarted) {
-        active.answerStarted = true;
-        active.thinkingDetails.open = false;
-        active.statusDetails.open = false;
-        active.evidenceDetails.open = false;
+      if (!state.active.answerStarted) {
+        state.active.answerStarted = true;
+        state.active.thinkingDetails.open = false;
+        state.active.statusDetails.open = false;
+        state.active.evidenceDetails.open = false;
       }
-      active.answerMd = (active.answerMd ?? "") + (msg.text ?? "");
-      renderMarkdown(active.finalText, active.answerMd);
-      scrollToBottom();
+      state.active.answerMd = (state.active.answerMd ?? "") + (msg.text ?? "");
+      renderMarkdown(state.active.finalText, state.active.answerMd);
+      scrollMessagesToBottom();
       return;
     }
 
     if (msg.type === "error") {
       const trace = msg.trace ? `\n${msg.trace}` : "";
-      active.answerMd = (active.answerMd ?? "") + `\n\n\
-\`\`\`\n[error] ${msg.message ?? "unknown"}${trace}\n\`\`\`\n`;
-      renderMarkdown(active.finalText, active.answerMd);
-      scrollToBottom();
+      state.active.answerMd = (state.active.answerMd ?? "") + `\n\n\`\`\`\n[error] ${msg.message ?? "unknown"}${trace}\n\`\`\`\n`;
+      renderMarkdown(state.active.finalText, state.active.answerMd);
+      scrollMessagesToBottom();
       return;
     }
 
     if (msg.type === "done") {
-      active = null;
-      streamEl.appendChild(mkInputBlock());
-      scrollToBottom();
+      const finishedConversationId = state.active.conversationId;
+      state.active = null;
+      refreshConversations({ autoSelect: false }).then(() => {
+        if (state.currentConversationId === finishedConversationId) {
+          renderConversationList();
+          updateConversationHeader();
+        }
+      }).catch((err) => {
+        console.error(err);
+      });
       return;
     }
   };
 }
 
-connectWS();
-
-function sendQuestion(text, inputBlock) {
-  if (!wsReady || !ws) {
+async function sendQuestion() {
+  const text = questionInput.value.trim();
+  if (!text) return;
+  if (!state.wsReady || !state.ws) {
     alert("WebSocket not ready, please wait...");
+    return;
+  }
+  if (!state.currentConversationId) {
+    alert("请先选择一个会话。");
+    return;
+  }
+  if (state.active) {
+    alert("当前会话正在生成回答，请稍候。");
     return;
   }
 
   const qBlock = mkQuestionBlock(text);
   const a = mkAnswerBlock();
+  messagesEl.appendChild(qBlock);
+  messagesEl.appendChild(a.block);
+  state.active = { ...a, conversationId: state.currentConversationId };
 
-  streamEl.replaceChild(qBlock, inputBlock);
-  streamEl.appendChild(a.block);
-  active = a;
+  state.ws.send(JSON.stringify({
+    type: "question",
+    text,
+    conversation_id: state.currentConversationId,
+  }));
 
-  ws.send(JSON.stringify({ type: "question", text }));
-  scrollToBottom();
+  questionInput.value = "";
+  questionInput.style.height = "auto";
+  scrollMessagesToBottom();
 }
 
-streamEl.appendChild(mkInputBlock());
+questionInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.ctrlKey) {
+    e.preventDefault();
+    sendQuestion().catch((err) => {
+      alert(String(err));
+    });
+  }
+});
+
+sendBtn.addEventListener("click", () => {
+  sendQuestion().catch((err) => {
+    alert(String(err));
+  });
+});
+
+newConversationBtn.addEventListener("click", () => {
+  createConversation().catch((err) => {
+    alert(String(err));
+  });
+});
+
+renameConversationBtn.addEventListener("click", () => {
+  renameConversation().catch((err) => {
+    alert(String(err));
+  });
+});
+
+deleteConversationBtn.addEventListener("click", () => {
+  deleteConversation().catch((err) => {
+    alert(String(err));
+  });
+});
+
+async function bootstrap() {
+  connectWS();
+  await refreshConversations({ autoSelect: true });
+  await loadMessages(state.currentConversationId);
+}
+
+bootstrap().catch((err) => {
+  alert(String(err));
+});
