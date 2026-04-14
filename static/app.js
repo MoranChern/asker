@@ -113,7 +113,7 @@ function mkAnswerBlock() {
   thinkingDetails.open = true;
 
   const thinkingSummary = document.createElement("summary");
-  thinkingSummary.textContent = "Model Thinking";
+  thinkingSummary.textContent = "Workflow Thinking";
   thinkingDetails.appendChild(thinkingSummary);
 
   const thinkingPre = document.createElement("pre");
@@ -125,6 +125,12 @@ function mkAnswerBlock() {
 
   const statusSummary = document.createElement("summary");
   statusSummary.textContent = "Status / Logs";
+
+  const thinkingHint = document.createElement("div");
+  thinkingHint.className = "thinking-hint";
+  thinkingHint.textContent = "";
+  // thinkingHint.textContent = "这里展示的是面向用户的工作流思考摘要，不是模型原始 CoT。";
+  thinkingDetails.appendChild(thinkingHint);
   statusDetails.appendChild(statusSummary);
 
   const statusPre = document.createElement("pre");

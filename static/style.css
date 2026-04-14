@@ -324,3 +324,10 @@ pre {
     border-bottom: 1px solid rgba(15, 23, 42, 0.08);
   }
 }
+
+.thinking-hint {
+  margin-top: 8px;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.5;
+}
