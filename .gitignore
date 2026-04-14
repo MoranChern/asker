@@ -4,3 +4,5 @@ neo_data*
 neo4j/
 
 local_context/
+
+tmp/
