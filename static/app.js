@@ -179,6 +179,107 @@ function mkAnswerBlock() {
   };
 }
 
+function finalizeAnswerBlock(answerState) {
+  if (!answerState) return;
+
+  const noThinking = !answerState.thinkingPre.textContent.trim();
+  const noStatus = !answerState.statusPre.textContent.trim();
+  const noEvidence = !answerState.evidenceList.childElementCount;
+
+  answerState.thinkingDetails.hidden = noThinking;
+  answerState.statusDetails.hidden = noStatus;
+  answerState.evidenceDetails.hidden = noEvidence;
+
+  if (answerState.answerStarted) {
+    if (!noThinking) answerState.thinkingDetails.open = false;
+    if (!noStatus) answerState.statusDetails.open = false;
+    if (!noEvidence) answerState.evidenceDetails.open = false;
+  }
+}
+
+function applyAnswerMessage(answerState, msg) {
+  if (!answerState || !msg || !msg.type) return;
+
+  if (msg.type === "thinking_round") {
+    answerState.thinkingPre.textContent += `\n\n【思考 ${msg.round}】\n`;
+    return;
+  }
+
+  if (msg.type === "thinking") {
+    answerState.thinkingPre.textContent += msg.text ?? "";
+    return;
+  }
+
+  if (msg.type === "status") {
+    answerState.statusPre.textContent += msg.text ?? "";
+    return;
+  }
+
+  if (msg.type === "evidence") {
+    const items = msg.items ?? [];
+    answerState.evidenceList.innerHTML = "";
+    for (const it of items) {
+      renderEvidenceItem(it, answerState.evidenceList);
+    }
+    return;
+  }
+
+  if (msg.type === "answer") {
+    if (!answerState.answerStarted) {
+      answerState.answerStarted = true;
+      answerState.thinkingDetails.open = false;
+      answerState.statusDetails.open = false;
+      answerState.evidenceDetails.open = false;
+    }
+    answerState.answerMd = (answerState.answerMd ?? "") + (msg.text ?? "");
+    renderMarkdown(answerState.finalText, answerState.answerMd);
+    return;
+  }
+
+  if (msg.type === "error") {
+    const trace = msg.trace ? `\n${msg.trace}` : "";
+    answerState.answerMd = (answerState.answerMd ?? "") + `\n\n\`\`\`\n[error] ${msg.message ?? "unknown"}${trace}\n\`\`\`\n`;
+    renderMarkdown(answerState.finalText, answerState.answerMd);
+  }
+}
+
+function storedItemToStreamMessage(item) {
+  if (!item || typeof item !== "object") return null;
+
+  const kind = String(item.kind || "message");
+  const payload = item.payload && typeof item.payload === "object" ? item.payload : null;
+
+  if (kind === "message") {
+    if (item.role === "assistant") {
+      return { type: "answer", text: item.content ?? "" };
+    }
+    return null;
+  }
+
+  if (payload && payload.type) {
+    return payload;
+  }
+
+  if (kind === "thinking_round") {
+    const round = payload && payload.round != null ? payload.round : "?";
+    return { type: "thinking_round", round };
+  }
+
+  if (kind === "thinking" || kind === "status") {
+    return { type: kind, text: item.content ?? "" };
+  }
+
+  if (kind === "evidence") {
+    return { type: "evidence", items: [] };
+  }
+
+  if (kind === "error") {
+    return { type: "error", message: item.content ?? "unknown" };
+  }
+
+  return null;
+}
+
 function renderEvidenceItem(item, evidenceList) {
   const wrap = document.createElement("div");
   wrap.className = "evidence-item";
@@ -396,13 +497,38 @@ async function loadMessages(conversationId) {
   }
   const data = await requestJson(`/api/conversations/${encodeURIComponent(conversationId)}/messages`);
   const items = Array.isArray(data?.items) ? data.items : [];
+
+  let currentAnswer = null;
+  const historyAnswers = [];
+
+  const ensureHistoryAnswerBlock = () => {
+    if (currentAnswer) return currentAnswer;
+    currentAnswer = mkAnswerBlock();
+    messagesEl.appendChild(currentAnswer.block);
+    historyAnswers.push(currentAnswer);
+    return currentAnswer;
+  };
+
   for (const item of items) {
-    if (item.role === "user") {
+    const kind = String(item.kind || "message");
+
+    if (kind === "message" && item.role === "user") {
+      currentAnswer = null;
       messagesEl.appendChild(mkQuestionBlock(item.content ?? ""));
-    } else if (item.role === "assistant") {
-      messagesEl.appendChild(mkHistoryAnswerBlock(item.content ?? ""));
+      continue;
     }
+
+    const streamMsg = storedItemToStreamMessage(item);
+    if (!streamMsg) continue;
+
+    const answerState = ensureHistoryAnswerBlock();
+    applyAnswerMessage(answerState, streamMsg);
   }
+
+  for (const answerState of historyAnswers) {
+    finalizeAnswerBlock(answerState);
+  }
+
   updateConversationHeader();
   scrollMessagesToBottom();
 }
@@ -489,48 +615,11 @@ function connectWS() {
       return;
     }
 
-    if (msg.type === "thinking_round") {
-      state.active.thinkingPre.textContent += `\n\n【思考 ${msg.round}】\n`;
-      return;
-    }
-
-    if (msg.type === "thinking") {
-      state.active.thinkingPre.textContent += msg.text ?? "";
-      return;
-    }
-
-    if (msg.type === "status") {
-      state.active.statusPre.textContent += msg.text ?? "";
-      return;
-    }
-
-    if (msg.type === "evidence") {
-      const items = msg.items ?? [];
-      state.active.evidenceList.innerHTML = "";
-      for (const it of items) {
-        renderEvidenceItem(it, state.active.evidenceList);
+    if (["thinking_round", "thinking", "status", "evidence", "answer", "error"].includes(msg.type)) {
+      applyAnswerMessage(state.active, msg);
+      if (msg.type === "answer" || msg.type === "error") {
+        scrollMessagesToBottom();
       }
-      return;
-    }
-
-    if (msg.type === "answer") {
-      if (!state.active.answerStarted) {
-        state.active.answerStarted = true;
-        state.active.thinkingDetails.open = false;
-        state.active.statusDetails.open = false;
-        state.active.evidenceDetails.open = false;
-      }
-      state.active.answerMd = (state.active.answerMd ?? "") + (msg.text ?? "");
-      renderMarkdown(state.active.finalText, state.active.answerMd);
-      scrollMessagesToBottom();
-      return;
-    }
-
-    if (msg.type === "error") {
-      const trace = msg.trace ? `\n${msg.trace}` : "";
-      state.active.answerMd = (state.active.answerMd ?? "") + `\n\n\`\`\`\n[error] ${msg.message ?? "unknown"}${trace}\n\`\`\`\n`;
-      renderMarkdown(state.active.finalText, state.active.answerMd);
-      scrollMessagesToBottom();
       return;
     }
 

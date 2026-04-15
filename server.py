@@ -102,6 +102,7 @@ if not CHAT_STORAGE_DIR.is_absolute():
     CHAT_STORAGE_DIR = BASE_DIR / CHAT_STORAGE_DIR
 CHAT_DB_PATH = CHAT_STORAGE_DIR / str(getattr(C, "CHAT_DB_FILENAME", "chat_history.sqlite3") or "chat_history.sqlite3")
 HISTORY_MESSAGE_LIMIT = int(getattr(C, "HISTORY_MESSAGE_LIMIT", 12))
+EVENT_KINDS = {"message", "thinking_round", "thinking", "status", "evidence", "error"}
 
 
 def utc_now_iso() -> str:
@@ -131,13 +132,31 @@ def _conversation_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 def _message_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    payload_raw = row["payload"] if "payload" in row.keys() else None
+    payload: Any = None
+    if payload_raw not in (None, ""):
+        try:
+            payload = json.loads(str(payload_raw))
+        except Exception:
+            payload = str(payload_raw)
+
     return {
         "id": int(row["id"]),
         "conversation_id": str(row["conversation_id"]),
         "role": str(row["role"]),
+        "kind": str(row["kind"] if "kind" in row.keys() and row["kind"] else "message"),
         "content": str(row["content"]),
+        "payload": payload,
         "created_at": str(row["created_at"]),
     }
+
+
+def _ensure_messages_table_columns(conn: sqlite3.Connection) -> None:
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "kind" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'")
+    if "payload" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN payload TEXT")
 
 
 def init_chat_db() -> None:
@@ -165,8 +184,12 @@ def init_chat_db() -> None:
             )
             """
         )
+        _ensure_messages_table_columns(conn)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_id ON messages(conversation_id, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_conversation_kind_id ON messages(conversation_id, kind, id)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations(updated_at DESC, created_at DESC)"
@@ -195,7 +218,7 @@ def _create_conversation_locked(conn: sqlite3.Connection, title: Optional[str]) 
     row = conn.execute(
         """
         SELECT c.id, c.title, c.created_at, c.updated_at,
-               COALESCE(COUNT(m.id), 0) AS message_count
+               COALESCE(SUM(CASE WHEN COALESCE(m.kind, 'message') = 'message' THEN 1 ELSE 0 END), 0) AS message_count
         FROM conversations c
         LEFT JOIN messages m ON m.conversation_id = c.id
         WHERE c.id = ?
@@ -212,7 +235,7 @@ def list_conversations_db() -> List[Dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT c.id, c.title, c.created_at, c.updated_at,
-                   COALESCE(COUNT(m.id), 0) AS message_count
+                   COALESCE(SUM(CASE WHEN COALESCE(m.kind, 'message') = 'message' THEN 1 ELSE 0 END), 0) AS message_count
             FROM conversations c
             LEFT JOIN messages m ON m.conversation_id = c.id
             GROUP BY c.id, c.title, c.created_at, c.updated_at
@@ -227,7 +250,7 @@ def get_conversation_db(conversation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             """
             SELECT c.id, c.title, c.created_at, c.updated_at,
-                   COALESCE(COUNT(m.id), 0) AS message_count
+                   COALESCE(SUM(CASE WHEN COALESCE(m.kind, 'message') = 'message' THEN 1 ELSE 0 END), 0) AS message_count
             FROM conversations c
             LEFT JOIN messages m ON m.conversation_id = c.id
             WHERE c.id = ?
@@ -277,54 +300,76 @@ def delete_conversation_db(conversation_id: str) -> None:
         conn.commit()
 
 
-def get_messages_db(conversation_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def get_messages_db(
+    conversation_id: str,
+    limit: Optional[int] = None,
+    *,
+    only_chat_messages: bool = False,
+) -> List[Dict[str, Any]]:
     if get_conversation_db(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
 
+    where_sql = "WHERE conversation_id = ?"
+    params: List[Any] = [conversation_id]
+    if only_chat_messages:
+        where_sql += " AND COALESCE(kind, 'message') = 'message'"
+
     with db_connect() as conn:
         if limit is None:
-            rows = conn.execute(
-                """
-                SELECT id, conversation_id, role, content, created_at
+            sql = f"""
+                SELECT id, conversation_id, role, content, kind, payload, created_at
                 FROM messages
-                WHERE conversation_id = ?
+                {where_sql}
                 ORDER BY id ASC
-                """,
-                (conversation_id,),
-            ).fetchall()
+            """
+            rows = conn.execute(sql, tuple(params)).fetchall()
         else:
-            rows = conn.execute(
-                """
-                SELECT id, conversation_id, role, content, created_at
+            sql = f"""
+                SELECT id, conversation_id, role, content, kind, payload, created_at
                 FROM (
-                    SELECT id, conversation_id, role, content, created_at
+                    SELECT id, conversation_id, role, content, kind, payload, created_at
                     FROM messages
-                    WHERE conversation_id = ?
+                    {where_sql}
                     ORDER BY id DESC
                     LIMIT ?
                 )
                 ORDER BY id ASC
-                """,
-                (conversation_id, int(limit)),
-            ).fetchall()
+            """
+            rows = conn.execute(sql, tuple(params + [int(limit)])).fetchall()
     return [_message_row_to_dict(row) for row in rows]
 
 
-def save_message_db(conversation_id: str, role: str, content: str) -> Dict[str, Any]:
+def save_message_db(
+    conversation_id: str,
+    role: str,
+    content: str,
+    *,
+    kind: str = "message",
+    payload: Optional[Any] = None,
+) -> Dict[str, Any]:
     msg_role = str(role or "").strip().lower()
     if msg_role not in ("system", "user", "assistant"):
         raise ValueError(f"invalid role: {role}")
+
+    msg_kind = str(kind or "message").strip().lower() or "message"
+    if msg_kind not in EVENT_KINDS:
+        raise ValueError(f"invalid kind: {kind}")
+
     if get_conversation_db(conversation_id) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
+
+    payload_text: Optional[str] = None
+    if payload is not None:
+        payload_text = json.dumps(json_safe(payload), ensure_ascii=False)
 
     now = utc_now_iso()
     with db_connect() as conn:
         cur = conn.execute(
             """
-            INSERT INTO messages(conversation_id, role, content, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO messages(conversation_id, role, content, kind, payload, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (conversation_id, msg_role, content, now),
+            (conversation_id, msg_role, content, msg_kind, payload_text, now),
         )
         conn.execute(
             "UPDATE conversations SET updated_at = ? WHERE id = ?",
@@ -333,7 +378,7 @@ def save_message_db(conversation_id: str, role: str, content: str) -> Dict[str, 
         conn.commit()
         row = conn.execute(
             """
-            SELECT id, conversation_id, role, content, created_at
+            SELECT id, conversation_id, role, content, kind, payload, created_at
             FROM messages
             WHERE id = ?
             """,
@@ -341,6 +386,37 @@ def save_message_db(conversation_id: str, role: str, content: str) -> Dict[str, 
         ).fetchone()
     assert row is not None
     return _message_row_to_dict(row)
+
+
+def save_event_db(conversation_id: str, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    typ = str(event.get("type", "")).strip().lower()
+    if typ not in EVENT_KINDS or typ == "message":
+        return None
+
+    content = ""
+    if typ == "thinking_round":
+        round_idx = event.get("round")
+        content = f"\n\n【思考 {round_idx}】\n" if round_idx is not None else "\n\n【思考】\n"
+    elif typ in ("thinking", "status"):
+        content = str(event.get("text", "") or "")
+    elif typ == "error":
+        trace = str(event.get("trace", "") or "").strip()
+        message = str(event.get("message", "unknown") or "unknown")
+        content = f"[error] {message}" + (f"\n{trace}" if trace else "")
+    elif typ == "evidence":
+        items = event.get("items") or []
+        if isinstance(items, list):
+            content = f"evidence items={len(items)}"
+        else:
+            content = "evidence"
+
+    return save_message_db(
+        conversation_id,
+        "assistant",
+        content,
+        kind=typ,
+        payload=event,
+    )
 
 
 def get_or_create_latest_conversation() -> Dict[str, Any]:
@@ -712,7 +788,17 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 conv = get_or_create_latest_conversation()
                 conv_id = str(conv["id"])
 
-            await emit({
+            async def emit_live(obj: Dict[str, Any]) -> None:
+                await websocket.send_text(json.dumps(obj, ensure_ascii=False))
+
+            async def emit_and_persist(obj: Dict[str, Any]) -> None:
+                await emit_live(obj)
+                try:
+                    save_event_db(conv_id, obj)
+                except Exception as persist_exc:
+                    print(f"[warn] failed to persist event {obj.get('type')}: {persist_exc}")
+
+            await emit_live({
                 "type": "conversation_meta",
                 "conversation_id": conv_id,
                 "conversation_title": conv.get("title", ""),
@@ -720,8 +806,10 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
             history_messages = [
                 {"role": item["role"], "content": item["content"]}
-                for item in get_messages_db(conv_id, limit=HISTORY_MESSAGE_LIMIT)
+                for item in get_messages_db(conv_id, limit=HISTORY_MESSAGE_LIMIT, only_chat_messages=True)
             ]
+
+            save_message_db(conv_id, "user", question)
 
             tool = GraphSearchTool(
                 driver=_DRIVER,
@@ -739,7 +827,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 return await _spawn_gpu_worker(
                     messages=messages,
                     think=think,
-                    emit=emit,
+                    emit=emit_and_persist,
                     forward_answer_events=forward_answer_events,
                     forward_done_event=forward_done_event,
                 )
@@ -749,12 +837,11 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                     question=question,
                     llm_call=llm_call,
                     search_tool=tool,
-                    emit=emit,
+                    emit=emit_and_persist,
                     max_search_rounds=3,
                     chat_history=history_messages,
                 )
                 if answer_text:
-                    save_message_db(conv_id, "user", question)
                     save_message_db(conv_id, "assistant", answer_text)
             except WebSocketDisconnect:
                 raise
@@ -763,8 +850,8 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 print("[server] agent exception:", exc)
                 print(tb)
                 try:
-                    await emit({"type": "error", "message": f"server exception: {exc}", "trace": tb})
-                    await emit({"type": "done"})
+                    await emit_and_persist({"type": "error", "message": f"server exception: {exc}", "trace": tb})
+                    await emit_live({"type": "done"})
                 except Exception:
                     pass
 

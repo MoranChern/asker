@@ -512,10 +512,14 @@ class LocalClientApp:
             return
         for item in items:
             role = str(item.get("role", ""))
+            kind = str(item.get("kind", "message"))
             content = str(item.get("content", "")).strip()
             if len(content) > 300:
                 content = content[:300] + "..."
-            print(f"- {role}: {content}")
+            if kind == "message":
+                print(f"- {role}: {content}")
+            else:
+                print(f"- {kind}/{role}: {content}")
 
     def print_current_conversation(self) -> None:
         conv = self._require_current_conversation()
@@ -717,6 +721,11 @@ class LocalClientApp:
                 self.current_conversation_id = conv_id
             if conv_title:
                 self.current_conversation_title = conv_title
+            return "continue"
+
+        if typ == "thinking_round":
+            round_idx = msg.get("round")
+            self._print_thinking("thinking", f"\n【思考 {round_idx}】\n")
             return "continue"
 
         if typ == "thinking":
